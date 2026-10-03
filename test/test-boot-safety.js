@@ -69,14 +69,13 @@ const bootstrap = {
   on: function (name, fn) { if (name) { /* record nothing */ } return function () {} },
   inject: function (deps, cb) {
     // Provide every service the plugin injects, so apply() runs to completion.
-    // A MISSING entry here surfaces as a TypeError rather than a false pass, which
-    // is how this file caught its own gap when the mode route and the old/new sync
-    // were added.
+    // A MISSING entry here surfaces as a TypeError rather than a false pass, which is
+    // how this file caught its own gap when the state route was first added.
     const services = {
-      // The sync injection reads syncCtx.effect and syncCtx.get as well as the two
-      // services, so the scoped context object mirrors the outer context's helpers.
-      // Real ctx.effect(callback) EXECUTES the callback and keeps the returned
-      // disposer; state a plugin assigns inside its effect depends on that.
+      // The scoped context object mirrors the outer context's helpers, because a plugin
+      // may read them off the injected scope. Real ctx.effect(callback) EXECUTES the
+      // callback and keeps the returned disposer; state a plugin assigns inside its
+      // effect depends on that.
       effect: function (fn) { fn(); return function () {} },
       get: function () { return undefined },
       on: function () { return function () {} },

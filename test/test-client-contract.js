@@ -278,32 +278,32 @@ if (factory === undefined) {
 
       activeLocale = 'zh-CN'
       const zhText = renderedText()
-      const zhOk = zhText.indexOf('权限') !== -1
+      const zhOk = zhText.indexOf('外部读取') !== -1
       if (!zhOk) failures += 1
       console.log((zhOk ? 'PASS' : 'FAIL') + ' | active locale zh-CN renders Chinese (' + zhText.slice(0, 56) + '...)')
 
       activeLocale = 'en'
       const enText = renderedText()
-      const enOk = enText.indexOf('Permission') !== -1
+      const enOk = enText.indexOf('Outside read') !== -1
       if (!enOk) failures += 1
       console.log((enOk ? 'PASS' : 'FAIL') + ' | active locale en renders English (' + enText.slice(0, 56) + '...)')
 
       // A prefix tag must match, or every zh-CN/zh-Hant user silently gets English.
       activeLocale = 'zh-Hant'
-      const taggedOk = renderedText().indexOf('权限') !== -1
+      const taggedOk = renderedText().indexOf('外部读取') !== -1
       if (!taggedOk) failures += 1
       console.log((taggedOk ? 'PASS' : 'FAIL') + ' | a region-tagged zh locale matches by prefix, not equality')
 
       // An unknown locale must land on English, the documented terminal fallback.
       activeLocale = 'de'
-      const fallbackLangOk = renderedText().indexOf('Permission') !== -1
+      const fallbackLangOk = renderedText().indexOf('Outside read') !== -1
       if (!fallbackLangOk) failures += 1
       console.log((fallbackLangOk ? 'PASS' : 'FAIL') + ' | an unknown locale falls back to English')
 
-      // The four MODE NAMES only render on the open panel, so the checks above cannot see
-      // them. This renders the panel by driving the component's own state through a
-      // STATEFUL React stub: applying the recorded click handler is what a user does, and
-      // the setter must actually store the new value or `open` never flips.
+      // The detail and the note only render on the open panel, so the checks above cannot see them.
+      // This renders the panel by driving the component's own state through a STATEFUL React stub:
+      // applying the recorded click handler is what a user does, and the setter must actually store the
+      // new value or `open` never flips.
       function renderPanelText() {
         const slots = [null, null, null]
         let cursor = 0
@@ -352,33 +352,36 @@ if (factory === undefined) {
 
       activeLocale = 'zh-CN'
       const zhPanel = renderPanelText()
-      const zhModes = zhPanel.indexOf('工作区查看') !== -1 && zhPanel.indexOf('完全权限') !== -1
-      if (!zhModes) failures += 1
-      console.log((zhModes ? 'PASS' : 'FAIL') + ' | the open panel lists all four modes in Chinese (' + zhPanel.slice(0, 48) + '...)')
+      // The control reports ONE boolean now, so the panel carries the note rather than a list of four
+      // modes. Asserting the note keeps the panel from silently losing its only actionable text.
+      const zhNote = zhPanel.indexOf('只读显示') !== -1
+      if (!zhNote) failures += 1
+      console.log((zhNote ? 'PASS' : 'FAIL') + ' | the open panel carries the Chinese note (' + zhPanel.slice(0, 48) + '...)')
 
-      // THE UI MUST NOT NAME A MECHANISM THAT DOES NOT EXIST.
+      // THE UI MUST NOT NAME A MECHANISM THAT DOES NOT EXIST, OR ONE THAT NO LONGER APPLIES.
       //
-      // The note used to say "use the permission_mode tool". The tool is registered on the host, but
-      // it never reaches the model's tool list, so a reader following that advice finds nothing.
-      //
-      // The note only renders on the OPEN panel, so this reads the panel text rather than the collapsed
-      // indicator. Asserting against the collapsed render was this check's first version, and it would
-      // have passed or failed for the wrong reason.
+      // Two separate mistakes are guarded here. The note once said "use the permission_mode tool", but
+      // the tool never reaches the model's tool list, so a reader following that advice finds nothing.
+      // The note then said "use the built-in permission selector" — true when this plugin mirrored the
+      // harness sandbox, and FALSE after the redesign: the selector controls the kernel's WRITE mode and
+      // has no effect on outside reads at all.
       const mentionsTool = zhPanel.indexOf('permission_mode') !== -1
       if (mentionsTool) failures += 1
       console.log((mentionsTool ? 'FAIL' : 'PASS') + ' | the panel note does not point at the permission_mode tool')
 
       const namesSelector = zhPanel.indexOf('选择器') !== -1
+      if (namesSelector) failures += 1
+      console.log((namesSelector ? 'FAIL' : 'PASS') + ' | the panel note does NOT offer the built-in selector (it cannot change outside reads)')
+
       const namesFile = zhPanel.indexOf('permissions.json') !== -1
-      if (!namesSelector || !namesFile) failures += 1
-      console.log((namesSelector && namesFile ? 'PASS' : 'FAIL')
-        + ' | the panel note names both real routes (selector=' + namesSelector + ', file=' + namesFile + ')')
+      if (!namesFile) failures += 1
+      console.log((namesFile ? 'PASS' : 'FAIL') + ' | the panel note names the state file, which IS the real route')
 
       activeLocale = 'en'
       const enPanel = renderPanelText()
-      const enModes = enPanel.indexOf('Workspace read') !== -1 && enPanel.indexOf('Full access') !== -1
-      if (!enModes) failures += 1
-      console.log((enModes ? 'PASS' : 'FAIL') + ' | the open panel lists all four modes in English (' + enPanel.slice(0, 48) + '...)')
+      const enNote = enPanel.indexOf('Read-only display') !== -1
+      if (!enNote) failures += 1
+      console.log((enNote ? 'PASS' : 'FAIL') + ' | the open panel carries the English note (' + enPanel.slice(0, 48) + '...)')
       activeLocale = 'en'
 
       // With no locale service the UI must still render — degrading the TEXT, not the control.

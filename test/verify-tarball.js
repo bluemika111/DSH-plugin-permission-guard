@@ -89,10 +89,10 @@ try {
   check('fail-closed branch present: the tool refuses when tools.guard is missing',
     /refused: true/.test(installedSource), 'looking for the refusal in permission_mode')
 
-  // Locate the ACTUAL response payload, not the surrounding prose. The first attempt sliced from the
-  // route path to the registration log, which swept in the comments explaining what was removed —
-  // and a comment mentioning a field is not a disclosure. Match the JSON.stringify call instead.
-  const payloadMatch = /const payload = JSON\.stringify\(\{([\s\S]{0,400}?)\}\)/.exec(installedSource)
+  // Locate the ACTUAL response payload, not the surrounding prose. An earlier attempt sliced from the
+  // route path to the registration log, which swept in the comments explaining what was removed — and a
+  // comment mentioning a field is not a disclosure. Match the JSON.stringify call in res.end instead.
+  const payloadMatch = /res\.end\(JSON\.stringify\(\{([\s\S]{0,300}?)\}\)\)/.exec(installedSource)
   const payloadFields = payloadMatch === null ? null : payloadMatch[1]
   check('the HTTP payload was located', payloadFields !== null)
 
@@ -103,9 +103,8 @@ try {
       fields.indexOf('fallbackWorkspace') === -1 && fields.indexOf('workspace') === -1
         && fields.indexOf('stateFile') === -1,
       JSON.stringify(fields))
-    check('the HTTP payload returns only mode identity',
-      fields.length > 0 && fields.every(function (f) { return ['id', 'name', 'summary'].indexOf(f) !== -1 }),
-      JSON.stringify(fields))
+    check('the HTTP payload returns only the boolean and its display name',
+      fields.slice().sort().join(',') === 'name,outsideRead', JSON.stringify(fields))
   }
 
   // And drive it: mount the INSTALLED copy and confirm a switch is refused with no guard.
@@ -140,9 +139,15 @@ try {
   const set = tools.find(function (t) { return t.name === 'permission_mode' })
   check('the installed copy registers permission_mode', set !== undefined)
   if (set !== undefined) {
-    const attempt = set.execute({ mode: 4 }, {})
-    check('the installed copy REFUSES a switch with no tools.guard (fail-closed)',
-      attempt && attempt.refused === true, JSON.stringify(attempt).slice(0, 120))
+    // `outsideRead: true` is the request that matters: enabling outside reads is the escalation, so it
+    // is the one the installed copy must refuse when the monotonic guard is unavailable.
+    const attempt = set.execute({ outsideRead: true }, {})
+    check('the installed copy REFUSES the change with no tools.guard (fail-closed)',
+      attempt && attempt.refused === true, JSON.stringify(attempt).slice(0, 140))
+    const report = set.execute({}, {})
+    check('the installed copy still REPORTS without tools.guard',
+      report && report.state !== undefined && typeof report.state.outsideRead === 'boolean',
+      JSON.stringify(report).slice(0, 90))
   }
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true })

@@ -89,8 +89,11 @@ if (routes.length === 1) {
 
   const fields = parsed === null ? [] : Object.keys(parsed)
   console.log('    fields returned: ' + JSON.stringify(fields))
-  check('the payload carries only mode identity (id/name/summary)',
-    fields.every(function (f) { return ['id', 'name', 'summary'].indexOf(f) !== -1 }), JSON.stringify(fields))
+  // The payload is the state and its display name, and nothing else. `stateFile` is deliberately NOT
+  // here: a status surface must not double as a filesystem probe, which is what an earlier version did.
+  check('the payload carries only the boolean and its name',
+    fields.slice().sort().join(',') === 'name,outsideRead', JSON.stringify(fields))
+  check('the payload carries the boolean', parsed !== null && typeof parsed.outsideRead === 'boolean')
 
   for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) {
     const r = call(method)

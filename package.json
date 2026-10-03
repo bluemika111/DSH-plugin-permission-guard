@@ -1,8 +1,8 @@
 {
   "name": "dsh-plugin-permission-guard",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "private": false,
-  "description": "Four-mode file-permission fence for DeepSeek Harness (workspace read/write x outside read/write), enforced at the tool layer, with a read-only composer mode indicator and a locale-aware UI.",
+  "description": "Tool-layer fence for one dimension the harness sandbox does not have: whether the model may READ outside the session workspace. Writes stay the sandbox's business. Includes a locale-aware composer switch.",
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -29,7 +29,6 @@
   },
   "files": [
     "index.js",
-    "sync.js",
     "modes.js",
     "client.js",
     "cordis.patch.yml",
@@ -39,7 +38,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/test-matrix.js && node test/test-watch-sync.js && node test/test-boot-safety.js && node test/test-client-contract.js && node test/test-module-resolution.js && node test/probe-route-disclosure.js"
+    "test": "node test/test-matrix.js && node test/test-boot-safety.js && node test/test-client-contract.js && node test/test-module-resolution.js && node test/probe-route-disclosure.js"
   },
   "dsh": {
     "bundle": {

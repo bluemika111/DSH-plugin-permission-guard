@@ -1,122 +1,59 @@
 'use strict'
 
 /**
- * Tool-layer permission fence implementing the four modes in
- * D:\DeepSeek Harness\权限设置.txt.
+ * dsh-plugin-permission-guard — a tool-layer fence for the ONE dimension the harness kernel does not
+ * have: whether the model may read outside the session workspace.
  *
- * WHY THE TOOL LAYER. Upstream fences only WRITES, and its SandboxMode is a
- * closed three-value vocabulary (see ./modes.js). "非工作区不可读" has no upstream
- * mechanism, so this plugin adds one at `tools/pre-execute`.
+ * WHAT THIS PLUGIN DOES NOT DO, AND WHY THAT IS THE POINT
  *
- * WHAT THIS IS NOT. This is a policy check over model-controlled arguments, not a
- * kernel boundary. It sees the file tools exactly and shell commands only by
- * best-effort path extraction, so a deliberately obfuscated `pwsh` command
- * (variable-built paths, encoded strings, script content loaded at run time) can
- * get a read past it. Kernel-grade isolation of untrusted code remains
- * `ctx.shell`'s job. This is the ceiling the deployment chose.
+ * It does NOT fence writes. The harness's own sandbox already confines them per session, and an
+ * earlier version kept a second, four-valued opinion about them — which required keeping that opinion
+ * in step with the kernel in both directions. That sync layer was the source of nearly every bug this
+ * plugin has had: a state mapped to the wrong kernel value, a session-creation pin silently
+ * overwriting an operator's choice, and a reverse direction that fired from only one of its three
+ * possible triggers. All of it existed to answer a question the kernel already answers.
+ *
+ * So the model here is a single boolean, and this plugin never speaks to the kernel.
+ *
+ * THE COST, STATED PLAINLY: because it no longer sets kernel state, it cannot guarantee the kernel is
+ * no stricter than it is. If the operator selects a permissive built-in preset, outside WRITES are
+ * allowed and this plugin will not stop them. Writes are the operator's business through the harness's
+ * own control, by design.
  */
 
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const modes = require('./modes.js')
-const sync = require('./sync.js')
 
 /**
- * The mode state file, kept BESIDE THE PLUGIN rather than in the session workspace.
+ * The state file, kept BESIDE THE PLUGIN rather than in the session workspace.
  *
- * `__dirname` rather than a literal path, so the same code works whether the plugin
- * is being developed inside the workspace or installed under `${DSH_HOME}`.
- *
- * WHY IT MOVED OUT OF THE WORKSPACE: the workspace is writable by the agent, so a
- * state file living there was protected only by this plugin's own fence — a single
- * point of failure, and precisely the CVE-2026-82533 shape. Under `${DSH_HOME}` the
- * sibling security-guard plugin's control-plane guard covers it as well, giving two
- * independent layers. The fence below is retained: it stops the MODEL from rewiring
- * its own mode and reports the attempt, which is the actionable signal.
+ * `__dirname` rather than a literal path, so the same code works whether the plugin is being developed
+ * inside a workspace or installed under the harness home. Under `${DSH_HOME}` a sibling control-plane
+ * guard covers it too; the fence below is what stops the MODEL from flipping its own switch.
  */
 const STATE_FILE = path.join(__dirname, 'permissions.json')
 
 /**
- * The workspace used only when a tool execution carries no session cwd.
+ * Every file name this state file has ever had, for the self-escalation fence and the rename handover.
  *
- * THIS USED TO BE A HARD-CODED DEVELOPER PATH, which made the package non-distributable: every
- * other machine would have been judged against a directory it does not have. Two independent
- * misclassifications follow from a wrong constant — a real workspace file read as "outside"
- * (false denial) or an outside file read as "inside" (false allow, the dangerous direction).
- *
- * Resolution order, most authoritative first:
- *   1. `exec.agent.session.header.cwd` — the session's real workspace. Measured to be exact.
- *   2. `DSH_PERMISSION_GUARD_WORKSPACE` — an explicit operator override for unusual setups.
- *   3. the user's home directory.
- *
- * WHY NOT `process.cwd()`. It was the third step, and on DSH Desktop it resolves to the
- * APPLICATION INSTALL DIRECTORY — observed in the field as
- * `fallbackWorkspace: "C:/Program Files/DSH Desktop Beta"`. That is not a workspace anyone works
- * in, so any execution that reached the fallback would have had the operator's real workspace
- * classified as OUTSIDE, producing false denials against their own files. A fallback is supposed to
- * be a plausible location; the install directory is not one.
- *
- * The home directory is chosen because it is guaranteed to sit OUTSIDE any session workspace, so a
- * misclassification here denies rather than permits. That is the direction to fail in: a false
- * denial is visible and recoverable, a false allow is neither. It is also stable, exists on every
- * platform, and needs no probing.
- *
- * This value can only ever affect the FALLBACK case: whenever a session cwd exists it wins, so a
- * misconfigured fallback cannot override a correctly identified session.
- */
-function fallbackWorkspace() {
-  const override = process.env.DSH_PERMISSION_GUARD_WORKSPACE
-  if (typeof override === 'string' && override !== '') return normalizePath(override)
-  try {
-    return normalizePath(os.homedir())
-  } catch (error) {
-    // No home directory is close to unthinkable, but returning a path that certainly cannot be a
-    // workspace keeps the failure mode on the deny side.
-    return normalizePath(path.parse(process.cwd()).root || process.cwd())
-  }
-}
-
-/**
- * The starting mode when no state file exists.
- *
- * Defined in modes.js and re-exported here for readability. 2 ("Workspace write") rather than 1: a
- * fresh install that silently denies every write looks broken, and rather than 4, which would hand
- * out full access immediately. Mode 2 is the exact equivalent of the harness's own default
- * `workspace-write` policy, so installing this plugin does not change anyone's permissions.
- */
-const DEFAULT_MODE_ID = modes.DEFAULT_MODE_ID
-
-/**
- * Every file name this state file has ever had, for the self-escalation fence AND for
- * the one-time filename handover below.
- *
- * The fence is basename-based precisely because a path list drifts, and this list is the
- * one place that is allowed to change: a rename must leave the OLD name fenced too, or the
- * rename itself opens the hole (an agent could write the old name and have a later handover
- * promote it). Both names are therefore protected forever, not just while they are current.
+ * The fence matches on the BASENAME because a path list is what drifts, and a rename must leave the
+ * old name fenced too — otherwise the rename opens the hole the handover exists to close.
  */
 const STATE_FILE_BASENAMES = ['permissions.json', '权限设置.json']
 
-const stats = { denied: 0, allows: 0, shellPathsChecked: 0, shellPathsAllowed: 0, selfWriteBlocks: 0 }
+/** The field the state file stores, named so its meaning cannot be misread across versions. */
+const STATE_FIELD = 'outsideRead'
+
+const stats = { denied: 0, allows: 0, shellPathsChecked: 0, shellPathsAllowed: 0, selfFlipBlocks: 0 }
 const audit = []
 
-/**
- * Set while the sync injection is live; pushes a new four-mode value onto the old
- * model. Null when the sync dependencies are absent, so callers must check.
- */
-let syncPush = null
-
-let ctx0 = null
-
-/**
- * Whether the monotonic `tools.guard` seam was available and the mode-switch control is armed.
- *
- * Recorded rather than merely logged: without it the `permission_mode` tool is a self-escalation
- * path, and a capability that silently degrades is worse than one that never existed. Surfaced in
- * `statusReport` so it can be checked without reading startup logs.
- */
+/** Set once the monotonic guard is registered: without it the tool must refuse to change anything. */
 let guardArmed = false
+
+/** How many times the tool narrowed the setting. Widening is refused, so this is the only direction. */
+let narrowingsByTool = 0
 
 // ---------------------------------------------------------------- path helpers
 
@@ -124,100 +61,77 @@ function normalizePath(value) {
   return String(value).replace(/\\/g, '/').replace(/\/+$/, '')
 }
 
-function isAbsolute(p) {
-  return path.isAbsolute(p)
+/** The workspace used only when a tool execution carries no session cwd. */
+function fallbackWorkspace() {
+  const override = process.env.DSH_PERMISSION_GUARD_WORKSPACE
+  if (typeof override === 'string' && override !== '') return normalizePath(override)
+  try {
+    return normalizePath(os.homedir())
+  } catch (error) {
+    return normalizePath(path.parse(process.cwd()).root || process.cwd())
+  }
 }
 
-/** The session workspace, falling back only when the execution carries no session cwd. */
+/**
+ * The workspace this call is judged against.
+ *
+ * `exec.agent.session.header.cwd` is the session's real workspace and is exact. The fallback exists
+ * only for an execution carrying no session, and it is deliberately a location that cannot be a
+ * workspace (the home directory) so a fallback misclassification DENIES rather than permits. It used
+ * to be `process.cwd()`, which on DSH Desktop is the application install directory — observed in the
+ * field, and it would have classified the operator's real workspace as outside.
+ */
 function resolveWorkspace(exec) {
   try {
     const cwd = exec && exec.agent && exec.agent.session && exec.agent.session.header
       ? exec.agent.session.header.cwd
       : undefined
     if (typeof cwd === 'string' && cwd !== '') return normalizePath(cwd)
-  } catch (error) { /* fall through to the resolved fallback */ }
+  } catch (error) { /* fall through */ }
   return fallbackWorkspace()
 }
 
-/** Resolve an argument path against the workspace and normalize it. */
 function resolveCandidate(candidate, workspace) {
   const text = String(candidate)
-  if (isAbsolute(text)) return normalizePath(text)
+  if (path.isAbsolute(text)) return normalizePath(text)
   return normalizePath(path.resolve(workspace, text))
 }
 
 function isUnder(target, root) {
   if (root === '') return false
-  // Windows path comparison is case-insensitive; the harness targets Windows here.
   const t = target.toLowerCase()
   const r = root.toLowerCase()
   return t === r || t.startsWith(r + '/')
 }
 
-// ------------------------------------------------------------------ mode state
+// ------------------------------------------------------------------ state
 
 /**
- * Read the persisted mode. Any failure falls back to the most restrictive mode.
+ * Interpret a parsed state file, or undefined when it holds no recognisable state.
  *
- * THE PLUGIN DIRECTORY'S FILE IS THE ONLY SOURCE OF TRUTH.
+ * MIGRATION FROM THE FOUR-MODE FILES. Earlier versions stored `mode: 1..4` across two axes; the old
+ * meaning of the outside-read dimension is `mode >= 3`, written out rather than inferred because
+ * getting it backwards would GRANT outside reads on upgrade:
  *
- * There is deliberately NO general fallback. An earlier version read a workspace-root copy
- * whenever this file was missing, so that relocating the file would not drop every
- * deployment to fail-safe mode 1. That was removed by operator decision, and the reasoning
- * is worth keeping:
- *
- *   - A fallback source is an ATTACK SURFACE. Any file the agent can write and the plugin
- *     will later trust is deferred self-escalation: plant a permissive mode now, wait for
- *     the live file to vanish.
- *   - It only ever fires in the degraded case, so it is the least exercised and least
- *     observed path — exactly where a wrong value does the most damage.
- *   - "Which file is authoritative?" had two answers, and the two could disagree.
- *
- * The ONE exception is `adoptRenamedStateFile()` below, a filename handover inside a single
- * directory rather than a permission fallback. It is bounded in a way the removed fallback
- * was not, and that difference is the reason it is allowed back: it can only succeed when
- * the authoritative file is ABSENT, it never consults another directory, and it PRESERVES
- * the mode the operator already chose instead of substituting a guess. A fallback that
- * changes the mode is dangerous; a rename that keeps it is not.
- *
- * No caching either. An earlier version memoised the first read into a module-level
- * `modeCache`, so a hand edit did not take effect until reload while the README promised
- * edits take effect immediately — the live guard kept denying under the old mode. A few
- * hundred bytes per tool call is not worth a stale permission decision.
+ *     old 1 "Workspace read"    outside not readable -> false
+ *     old 2 "Workspace write"   outside not readable -> false
+ *     old 3 "Outside readable"  outside readable     -> true
+ *     old 4 "Full access"       outside readable     -> true
  */
-function loadMode() {
-  try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8')
-    const parsed = JSON.parse(raw)
-    const found = modes.modeById(Number(parsed && parsed.mode))
-    if (found !== undefined) return found
-  } catch (error) { /* absent or malformed: try the rename handover, then fail safe */ }
-  return modes.modeById(adoptRenamedStateFile())
+function interpret(parsed) {
+  if (parsed === null || typeof parsed !== 'object') return undefined
+  if (typeof parsed[STATE_FIELD] === 'boolean') return { outsideRead: parsed[STATE_FIELD] }
+  if (typeof parsed.mode === 'number') return { outsideRead: parsed.mode >= 3, legacyMode: parsed.mode }
+  return undefined
 }
 
 /**
- * One-time handover from the state file's former name, in the SAME directory.
+ * Adopt a state file left under a former name in the SAME directory.
  *
- * WHY THIS EXISTS AT ALL, GIVEN THAT ALL FALLBACKS WERE DELETED
- *
- * The file was renamed `权限设置.json` -> `permissions.json`. Without a handover every
- * existing deployment would silently drop to fail-safe mode 1 on upgrade — a permission
- * change nobody asked for, caused purely by a cosmetic rename. That is the same failure the
- * removed workspace fallback existed to prevent, so refusing to handle it would be
- * consistency for its own sake.
- *
- * WHY IT IS NOT THE OLD FALLBACK IN DISGUISE
- *
- *   - It only reads a sibling of STATE_FILE, never another directory. The removed version
- *     reached into the workspace, which the agent can write; this one cannot.
- *   - It runs only when STATE_FILE is absent, and carries over the operator's existing mode
- *     rather than choosing one. No old file still means fail-closed mode 1.
- *   - It DELETES the old file on success, so it cannot fire twice and cannot resurrect a
- *     stale value if the new file is later removed. A permanent second copy was exactly the
- *     dormant-escalation problem; a consumed one is not.
- *
- * The old name stays in STATE_FILE_BASENAMES so the self-escalation fence protects it too —
- * otherwise the rename would open the very hole this function is here to close.
+ * The one handover that survives the removal of all fallbacks, bounded in a way the removed ones were
+ * not: it reads a sibling of the state file rather than another directory, runs only when the current
+ * name is absent, PRESERVES the operator's setting instead of guessing one, and deletes the old file so
+ * it cannot fire twice.
  */
 function adoptRenamedStateFile() {
   for (let i = 0; i < STATE_FILE_BASENAMES.length; i++) {
@@ -225,91 +139,57 @@ function adoptRenamedStateFile() {
     if (name === path.basename(STATE_FILE)) continue
     const candidate = path.join(path.dirname(STATE_FILE), name)
     try {
-      const parsed = JSON.parse(fs.readFileSync(candidate, 'utf8'))
-      const found = modes.modeById(Number(parsed && parsed.mode))
-      if (found === undefined) continue
-      persistMode(found)
-      // Consume the old file. If this fails the handover still succeeded, so it is reported
-      // rather than thrown: a stale duplicate is a hygiene problem, not a permissions one.
+      const adopted = interpret(JSON.parse(fs.readFileSync(candidate, 'utf8')))
+      if (adopted === undefined) continue
+      persistState(adopted)
       try {
         fs.unlinkSync(candidate)
       } catch (error) {
-        console.error('[permission-guard] renamed state file adopted but old copy could not be removed:', candidate, String(error))
+        console.error('[permission-guard] adopted the former state file but could not remove it:', candidate, String(error))
       }
-      console.log('[permission-guard] adopted state file', candidate, '->', STATE_FILE, '(mode ' + found.id + ')')
-      return found.id
+      console.log('[permission-guard] adopted state file', candidate, '->', STATE_FILE)
+      return adopted
     } catch (error) { /* absent or malformed: try the next former name */ }
   }
-  return DEFAULT_MODE_ID
+  return undefined
 }
 
-function currentMode() {
-  return loadMode()
+/**
+ * The effective state, read on every check (no cache: a stale permission decision is worse than a few
+ * hundred bytes per tool call). Order: the current file, then a renamed sibling, then the restrictive
+ * default — so a missing or broken file can only ever DENY outside reads, never allow them.
+ */
+function currentState() {
+  try {
+    const parsed = interpret(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')))
+    if (parsed !== undefined) {
+      if (parsed.legacyMode !== undefined) {
+        console.log('[permission-guard] migrated legacy mode', parsed.legacyMode, '-> outsideRead', parsed.outsideRead)
+        try { persistState(parsed) } catch (error) { /* re-migrated next call */ }
+      }
+      return { outsideRead: parsed.outsideRead }
+    }
+  } catch (error) { /* absent or malformed: try the handover */ }
+  const adopted = adoptRenamedStateFile()
+  if (adopted !== undefined) return { outsideRead: adopted.outsideRead }
+  return { outsideRead: modes.DEFAULT_OUTSIDE_READ }
 }
 
-function persistMode(mode) {
-  // NO `workspace` FIELD. Earlier versions wrote one here, and it was read by nothing while
-  // being wrong whenever the deployment moved or the operator opened a different workspace —
-  // a field that only misleads whoever opens the file. The workspace is not a property of the
-  // MODE; it belongs to the SESSION, and is resolved per call from the session header.
+function persistState(state) {
   const payload = {
-    mode: mode.id,
-    name: mode.name,
-    note: 'Read and written by the permission-guard plugin. Change the mode number (1-4) to switch; it takes effect on the next check.',
+    [STATE_FIELD]: state.outsideRead,
+    note: 'Read and written by the permission-guard plugin. This is the only setting it stores:'
+      + ' whether the model may READ outside the workspace. Writes are confined by the harness sandbox.',
   }
   fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2) + '\n', 'utf8')
 }
 
-/**
- * Whether a path names a mode state file, in ANY directory — not just the live one.
- *
- * WHY BASENAME, AND WHY THE NON-LIVE LOCATIONS STILL MATTER
- *
- * This began as an exact comparison against STATE_FILE, and that was the bug. Moving the
- * state file into the plugin directory made the check narrower in exactly the wrong place:
- * the workspace-root copy stopped being recognised, so a `write` straight to it sailed
- * through the fence. Observed, not theorised — two writes to `D:\DeepSeek Harness\权限设置.json`
- * were accepted while the guard was demonstrably live in the same session.
- *
- * The live file is now the ONLY authority (see `loadMode`), so a writable stray copy can no
- * longer be promoted by migration. The fence still refuses every location, for two reasons
- * that survive that change:
- *
- *   1. Defence in depth. "Nothing reads that file" is a property of TODAY'S code. The moment
- *      any future fallback, debug aid, or operator script consults a stray copy, a writable
- *      one becomes a live escalation path again. The fence should not have to be re-derived
- *      from the current read path.
- *   2. A stray copy IS a real permission file to a human. `security-guard` and this fence
- *      exist so that no file with this name is silently rewritten; if the model can edit
- *      one, an operator reading it later has no way to tell it was tampered with.
- *
- * Matching on the basename rather than enumerating paths is deliberate: a path list is
- * exactly what drifted out of sync here, and the file name is distinctive enough that the
- * false-positive cost is one refused call. The cost is real — an unrelated file with the same
- * name in another directory is also refused — and it is accepted.
- *
- * EVERY FORMER NAME IS FENCED TOO. The file was renamed once; fencing only the current name
- * would make the old name freely writable exactly when `adoptRenamedStateFile()` was reading
- * it as a legitimate source. A rename must not punch a hole in its own guard.
- */
-function isStateFile(target) {
-  const normalized = normalizePath(target).toLowerCase()
-  const base = normalized.split('/').pop()
-  if (base === '') return false
-  for (let i = 0; i < STATE_FILE_BASENAMES.length; i++) {
-    const name = String(STATE_FILE_BASENAMES[i]).toLowerCase()
-    if (name.length < 3) continue
-    if (base === name) return true
-  }
-  return false
+function stateName(state) {
+  const found = modes.stateByValue(state.outsideRead)
+  return found === undefined ? 'unknown' : found.name
 }
 
 // ------------------------------------------------------------------ decisions
-
-function decisionOk() {
-  stats.allows += 1
-  return null
-}
 
 function record(entry) {
   audit.push(entry)
@@ -317,32 +197,43 @@ function record(entry) {
   console.log('[permission-guard] DENY', entry.tool, entry.reason)
 }
 
-function decide(tool, target, kind, mode, exec) {
-  const where = kind === 'read' ? 'read' : 'write'
-  const inWorkspace = isUnder(target, resolveWorkspace(exec))
-  const allowed = inWorkspace
-    ? (kind === 'read' ? mode.workspaceRead : mode.workspaceWrite)
-    : (kind === 'read' ? mode['outside-read'] : mode['outside-write'])
+function allow() {
+  stats.allows += 1
+  return null
+}
 
-  if (allowed) return decisionOk()
-
+/**
+ * Deny access to a path outside the workspace while outside reads are disabled.
+ *
+ * THE WORDING NAMES THE SETTING, NOT THE OPERATION, on purpose: `fenceShell` also refuses commands
+ * that only write outside (see there for why), so a message saying "read denied" would be wrong for
+ * those.
+ */
+function denyOutside(tool, target, state) {
   stats.denied += 1
-  const scope = inWorkspace ? 'workspace' : 'outside the workspace'
-  const reason = 'Permission mode ' + mode.id + ' (' + mode.name + ') denies ' + where + ' on ' + scope + ': ' + target
-  const hint = 'Current mode is "' + mode.name + '" (' + mode.summary + '). '
-    + 'The model cannot raise its own permissions; ask the human to change the mode in ' + STATE_FILE
-    + ' or via the permission selector.'
-  const entry = {
+  const reason = 'Permission guard: ' + target + ' is outside the session workspace, and outside access is'
+    + ' currently disabled (outsideRead: ' + String(state.outsideRead) + '). The model cannot change'
+    + ' this setting itself. Ask the human to enable "Outside readable".'
+  record({
     at: new Date().toISOString(),
     tool: tool,
-    kind: kind,
-    scope: scope,
+    scope: 'outside the workspace',
     path: target,
-    mode: mode.id,
+    outsideRead: state.outsideRead,
     reason: reason,
-  }
-  record(entry)
-  return { kind: 'deny', reason: reason + '. ' + hint }
+  })
+  void tool
+  return { kind: 'deny', reason: reason }
+}
+
+/**
+ * The read policy: everything inside the workspace is readable; everything outside it follows the one
+ * setting. Writes are not judged here at all.
+ */
+function decideRead(tool, target, state, exec) {
+  if (state.outsideRead) return allow()
+  if (isUnder(target, resolveWorkspace(exec))) return allow()
+  return denyOutside(tool, target, state)
 }
 
 // -------------------------------------------------------------------- fencing
@@ -350,19 +241,16 @@ function decide(tool, target, kind, mode, exec) {
 /**
  * Split a shell command into tokens that look like filesystem paths.
  *
- * Best-effort by design: this catches the plain forms an agent actually writes
- * (`cat D:\x`, `Get-Content ../y`, `rg foo D:/z`) and explicitly does not attempt
- * to defeat deliberate obfuscation.
+ * Best-effort by design: it catches the plain forms an agent writes (`cat D:\x`, `Get-Content ../y`)
+ * and explicitly does not attempt to defeat deliberate obfuscation.
  */
 function extractShellPaths(command) {
   const found = []
   const text = String(command)
 
-  // Quoted spans first: a quoted path containing spaces must stay one token.
-  // Then REMOVE those spans before the bare-token pass, or the same path is
-  // re-split on whitespace and each fragment is judged as its own path. That
-  // bug resolved `D:\DeepSeek` (a fragment of `D:\DeepSeek Harness\sub\f.txt`)
-  // and denied a legitimate in-workspace read.
+  // Quoted spans first: a quoted path containing spaces must stay one token. Then REMOVE those spans
+  // before the bare-token pass, or the same path is re-split on whitespace and each fragment is judged
+  // separately — that bug resolved a fragment like `D:\DeepSeek` and denied a legitimate read.
   const quoted = /"[^"]*"|'[^']*'|`[^`]*`/g
   const spans = []
   let q
@@ -385,14 +273,10 @@ function extractShellPaths(command) {
 }
 
 /**
- * Decide whether one shell token is a filesystem path.
+ * Whether one shell token is a filesystem path.
  *
- * Deliberately strict about the bare-relative form. An earlier draft accepted any
- * `word/word` or `word\word` token, which classified the COMMAND NAME
- * `Get-Content` as a relative path and denied legitimate in-workspace reads. Bare
- * relative paths without a `./` or `../` prefix are rare in generated commands,
- * and PowerShell does not execute them from the current directory by default, so
- * dropping that form costs little and removes the false positive.
+ * Strict about the bare-relative form on purpose: an earlier draft accepted any `word/word` token,
+ * which classified the COMMAND NAME `Get-Content` as a path and denied legitimate reads.
  */
 function looksLikePath(token) {
   if (typeof token !== 'string') return false
@@ -405,96 +289,15 @@ function looksLikePath(token) {
   return false
 }
 
-/** Classify a shell command's likely intent. Writes are the conservative default. */
-const WRITE_VERBS = /\b(?:set-content|add-content|out-file|new-item|remove-item|move-item|copy-item|rename-item|mkdir|touch|rm|mv|cp|del|rd|md|tee)\b/i
-
-function fenceShell(exec, args, mode) {
-  const command = typeof args.command === 'string' ? args.command : ''
-  const writes = WRITE_VERBS.test(command)
-  const kind = writes ? 'write' : 'read'
-  const candidates = extractShellPaths(command)
-  for (let i = 0; i < candidates.length; i++) {
-    const target = resolveCandidate(candidates[i], resolveWorkspace(exec))
-    stats.shellPathsChecked += 1
-    const blocked = decide(exec.name, target, kind, mode, exec)
-    if (blocked !== null) {
-      return { kind: 'deny', reason: blocked.reason + ' (matched path "' + candidates[i] + '" in the shell command)' }
-    }
-    stats.shellPathsAllowed += 1
-  }
-  return null
-}
-
-function fencePathTool(exec, args, mode, kind, field) {
-  const value = args[field]
-  if (typeof value !== 'string' || value.trim() === '') return null
-  const target = resolveCandidate(value, resolveWorkspace(exec))
-  return decide(exec.name, target, kind, mode, exec)
-}
-
-function fenceTreeTool(exec, args, mode) {
-  const scopePath = typeof args.path === 'string' && args.path.trim() !== '' ? args.path : '.'
-  const target = resolveCandidate(scopePath, resolveWorkspace(exec))
-  return decide(exec.name, target, 'read', mode, exec)
-}
-
 /**
- * Tools that MUTATE, and the argument fields holding their target path.
+ * Shell WRITE verbs, by cmdlet and by script API.
  *
- * The self-escalation fence must apply to exactly these. An earlier version checked
- * every tool uniformly, so `read 权限设置.json` was refused too — wider than the
- * design intent. Harmless in direction, but it was "accidentally correct" rather
- * than designed, and it blocked the model from reading its own mode state.
+ * Script APIs are included because a cmdlet-only list was a real hole: the state file was once moved
+ * with `node -e "fs.renameSync(...)"`, which matched nothing and therefore ran unchecked.
  */
-const MUTATING_TOOLS = {
-  write: ['file_path'],
-  edit: ['file_path'],
-  str_replace_editor: ['path'],
-}
-const SHELL_MUTATION_VERBS = /\b(?:set-content|add-content|out-file|new-item|remove-item|move-item|copy-item|rename-item|mkdir|touch|rm|mv|cp|del|rd|md|tee)\b/i
+const SHELL_WRITE_VERBS = /\b(?:set-content|add-content|out-file|new-item|remove-item|move-item|copy-item|rename-item|mkdir|touch|rm|mv|cp|del|rd|md|tee|writeFileSync?|renameSync?|unlinkSync?|rmdirSync?|rmSync|mkdirSync?|copyFileSync?|cpSync|truncateSync?|appendFileSync?|createWriteStream|write_text|makedirs|rmtree|shutil\.(?:move|copy2?|copytree|rmtree)|os\.(?:rename|remove|unlink|rmdir|makedirs|mkdir)|\[IO\.File\]|\[System\.IO\.File\])\b/i
 
-/**
- * The same intent spelled as a SCRIPT-LANGUAGE FILE API instead of a shell cmdlet.
- *
- * WHAT THIS CLOSES (a real, observed hole)
- *
- * The list above held PowerShell cmdlets and POSIX utilities only. Moving the mode
- * state file out of the workspace was done with roughly
- *
- *     node -e "const fs=require('fs'); fs.renameSync('<src>', '<dst>')"
- *
- * and the fence did NOT fire. `renameSync` is none of the verbs above, so no target
- * path was extracted and nothing was ever compared against STATE_FILE. The guard was
- * blind to `node -e`, python heredocs, and every other scripted file write — exactly
- * the form an agent reaches for when a cmdlet is unavailable or a path contains
- * characters the shell would mangle.
- *
- * Matching is on the API NAME. These strings are rare in ordinary prose, and the
- * asymmetry is stark: a false positive costs one refused call, a false negative costs
- * a self-escalation. Covers the sync/async spellings, `fs.promises`, Python's os /
- * pathlib / shutil, and PowerShell's .NET file statics.
- */
-const SCRIPT_MUTATION_VERBS = /\b(?:writeFileSync?|renameSync?|unlinkSync?|rmdirSync?|rmSync|mkdirSync?|mkdirp|copyFileSync?|cpSync|truncateSync?|appendFileSync?|createWriteStream|chmodSync?|chownSync?|utimesSync?|linkSync?|symlinkSync?|write_text|write_bytes|makedirs|rmtree|shutil\.(?:move|copy2?|copytree|rmtree)|os\.(?:rename|remove|unlink|rmdir|makedirs|mkdir)|\[IO\.File\]|\[System\.IO\.File\])\b/i
-
-/**
- * Does a MUTATING shell command name the state file anywhere in its text?
- *
- * Needed because path EXTRACTION is deliberately strict — `looksLikePath` rejects
- * bare relative paths and anything under three characters — and a path embedded in a
- * script string often never becomes a standalone token. In the command above the
- * inner quotes terminate the outer quoted span, so the destination path is shredded
- * into fragments that `looksLikePath` then rejects. The basename is not a reliable
- * fallback either: it is permissions.json (or 权限设置.json), which the tokenizer can drop.
- *
- * So this is a second, independent signal: if a command already matched a mutation
- * verb AND names the state file — current name, any former name, full path or basename —
- * it is a write to the guard's own mode file.
- *
- * Scoped to the mutating branch only, so a read-only command that merely names the
- * file (`Get-Content ...\permissions.json`) still passes. That distinction is the point:
- * a WRITE-only fence is precisely what let the observed move through, while fencing
- * reads would deny the model knowledge of its own mode for no security gain.
- */
+/** Does a MUTATING shell command name the state file anywhere in its text? */
 function commandMentionsStateFile(command) {
   const slashed = String(command).replace(/\\/g, '/').toLowerCase()
   if (slashed.indexOf(normalizePath(STATE_FILE).toLowerCase()) !== -1) return true
@@ -505,39 +308,47 @@ function commandMentionsStateFile(command) {
   return false
 }
 
+/** Whether a path names a state file, in ANY directory and under any of its former names. */
+function isStateFile(target) {
+  const normalized = normalizePath(target).toLowerCase()
+  const base = normalized.split('/').pop()
+  if (base === '') return false
+  for (let i = 0; i < STATE_FILE_BASENAMES.length; i++) {
+    const name = String(STATE_FILE_BASENAMES[i]).toLowerCase()
+    if (name.length < 3) continue
+    if (base === name) return true
+  }
+  return false
+}
+
 /**
- * Deny a MUTATING tool call whose target is the mode state file.
+ * Deny a MUTATING tool call whose target is the state file.
  *
- * Without this the guard is self-defeating: 权限设置.json lives INSIDE the
- * workspace, which the agent may write, so an agent could raise its own mode and
- * thereby widen its own confinement — exactly the CVE-2026-82533 shape. Blocking
- * the agent's write does not affect the human: they edit the file with an editor,
- * which never passes through this tool seam.
+ * Without this the plugin is self-defeating: the file holds the switch, so a model that could write it
+ * would grant itself outside reads. The human is unaffected — an editor does not pass through the tool
+ * seam.
  *
- * Reads are deliberately NOT fenced: knowing the current mode is not a capability.
+ * Reads are deliberately NOT fenced: knowing the current setting is not a capability.
  */
 function fenceSelfWrite(exec, args) {
   const name = String(exec && exec.name ? exec.name : '')
   const targets = []
 
-  const fields = MUTATING_TOOLS[name]
+  const fields = (name === 'write' || name === 'edit')
+    ? ['file_path']
+    : (name === modes.STR_REPLACE_TOOL ? ['path'] : undefined)
+
   if (fields !== undefined) {
     for (let i = 0; i < fields.length; i++) {
       const value = args[fields[i]]
       if (typeof value === 'string' && value !== '') targets.push(value)
     }
   } else if (modes.SHELL_TOOLS.has(name)) {
-    // Only commands that actually mutate: a read-only shell command naming the
-    // file is observation, not escalation.
     const command = typeof args.command === 'string' ? args.command : ''
-    const mutates = SHELL_MUTATION_VERBS.test(command) || SCRIPT_MUTATION_VERBS.test(command)
-    if (mutates) {
-      // The raw-text signal is checked in addition to (not instead of) extracted
-      // paths: extraction misses paths buried inside script strings, which is
-      // exactly how the state-file move slipped past the first version.
-      if (commandMentionsStateFile(command)) {
-        targets.push(STATE_FILE)
-      }
+    if (SHELL_WRITE_VERBS.test(command)) {
+      // The raw-text signal is checked IN ADDITION to extracted paths: extraction misses a path buried
+      // inside a script string, which is exactly how the original state-file move slipped past.
+      if (commandMentionsStateFile(command)) targets.push(STATE_FILE)
       const extracted = extractShellPaths(command)
       for (let i = 0; i < extracted.length; i++) targets.push(extracted[i])
     }
@@ -548,47 +359,84 @@ function fenceSelfWrite(exec, args) {
   for (let i = 0; i < targets.length; i++) {
     const resolved = resolveCandidate(targets[i], resolveWorkspace(exec))
     if (!isStateFile(resolved)) continue
-    stats.selfWriteBlocks += 1
-    const entry = {
+    stats.selfFlipBlocks += 1
+    audit.push({
       at: new Date().toISOString(),
       tool: name,
-      reason: 'self-escalation guard: attempted to modify the permission mode file',
+      reason: 'self-escalation guard: attempted to modify the permission state file',
       path: resolved,
-      mode: currentMode().id,
-    }
-    audit.push(entry)
+      outsideRead: currentState().outsideRead,
+    })
     if (audit.length > 200) audit.splice(0, audit.length - 200)
-    console.log('[permission-guard] DENY self-write', entry.tool, resolved)
+    console.log('[permission-guard] DENY self-flip', name, resolved)
     return {
       kind: 'deny',
-      reason: 'The DSH permission guard denied this call (self-escalation guard): the target is the permission mode file itself ('
-        + resolved + '). The model cannot modify its own permission mode — that is the CVE-2026-82533 shape. '
-        + 'Ask the human to edit that file with an editor, or to switch mode through the permission selector.',
+      reason: 'The DSH permission guard denied this call (self-escalation guard): the target is the'
+        + ' permission state file itself (' + resolved + '). The model cannot change whether it may read'
+        + ' outside the workspace — that is the CVE-2026-82533 shape. Ask the human to edit that file or'
+        + ' to use the switch.',
     }
   }
   return null
 }
 
 /**
+ * Shell commands, judged for the paths they name.
+ *
+ * OVER-BLOCKING IS DELIBERATE. Any command naming a path outside the workspace is refused while
+ * outside reads are disabled, including one that only writes there. Two reasons:
+ *
+ *   1. Telling read positions from write positions in arbitrary shell text is not possible reliably,
+ *      and getting it wrong leaves a trivial bypass: `Get-Content C:\secret > out.txt` writes INSIDE
+ *      the workspace, which the kernel permits, while reading outside it — so a rule that skipped every
+ *      command containing a write verb would fence nothing that matters.
+ *   2. A refusal here is recoverable and visible; the alternative failure is a silent read of anything
+ *      on the machine.
+ *
+ * The only cost is that an outside WRITE is refused earlier than the kernel would refuse it, and the
+ * message names the setting rather than the operation so it stays accurate for both.
+ */
+function fenceShell(exec, args, state) {
+  if (state.outsideRead) return allow()
+  const command = typeof args.command === 'string' ? args.command : ''
+  const candidates = extractShellPaths(command)
+  for (let i = 0; i < candidates.length; i++) {
+    const target = resolveCandidate(candidates[i], resolveWorkspace(exec))
+    stats.shellPathsChecked += 1
+    const decision = decideRead(exec.name, target, state, exec)
+    if (decision !== null) {
+      return { kind: 'deny', reason: decision.reason + ' (matched path "' + candidates[i] + '" in the shell command)' }
+    }
+    stats.shellPathsAllowed += 1
+  }
+  return null
+}
+
+/**
  * Inspect one pending tool call. Returns a deny decision or null.
- * Fails OPEN on an internal error so a bug here cannot wedge every tool call,
- * but logs loudly, because a silent open failure would look identical to a pass.
+ *
+ * Fails OPEN on an internal error so a bug here cannot wedge every tool call, but logs loudly, because
+ * a silent open failure would look identical to a pass.
  */
 function inspect(exec) {
   try {
     const name = String(exec && exec.name ? exec.name : '')
     const args = exec && exec.arguments !== null && typeof exec.arguments === 'object' ? exec.arguments : {}
-    const mode = currentMode()
+    const state = currentState()
 
     // Checked first and for every tool, so no tool can reach around it.
     const selfWrite = fenceSelfWrite(exec, args)
     if (selfWrite !== null) return selfWrite
 
-    if (modes.PATH_READ_TOOLS.has(name)) return fencePathTool(exec, args, mode, 'read', 'file_path')
-    if (modes.PATH_WRITE_TOOLS.has(name)) return fencePathTool(exec, args, mode, 'write', 'file_path')
-    if (modes.STR_REPLACE_TOOL === name) return fencePathTool(exec, args, mode, 'write', 'path')
-    if (modes.TREE_READ_TOOLS.has(name)) return fenceTreeTool(exec, args, mode)
-    if (modes.SHELL_TOOLS.has(name)) return fenceShell(exec, args, mode)
+    // READS only. A write is the harness sandbox's business and is not judged here.
+    if (modes.PATH_READ_TOOLS.has(name)) {
+      return decideRead(name, resolveCandidate(args.file_path, resolveWorkspace(exec)), state, exec)
+    }
+    if (modes.TREE_READ_TOOLS.has(name)) {
+      const scopePath = typeof args.path === 'string' && args.path.trim() !== '' ? args.path : '.'
+      return decideRead(name, resolveCandidate(scopePath, resolveWorkspace(exec)), state, exec)
+    }
+    if (modes.SHELL_TOOLS.has(name)) return fenceShell(exec, args, state)
     return null
   } catch (error) {
     console.error('[permission-guard] inspection failed, allowing call:', String(error))
@@ -598,116 +446,13 @@ function inspect(exec) {
 
 // ------------------------------------------------------------------- reporting
 
-function modeLine(mode) {
-  return 'mode ' + mode.id + ' "' + mode.name + '" ' + mode.summary
-}
-
-/**
- * The model-facing description of the `permission_mode` tool.
- *
- * GENERATED from PERMISSION_MODES rather than typed out. The previous version hard-coded
- * the four mode names in a string literal, so renaming the file's modes to English left
- * the tool description advertising the old Chinese names — a drift the type system cannot
- * catch, and one that only shows up as a model picking a mode that no longer matches.
- */
-function toolDescription() {
-  const parts = modes.PERMISSION_MODES.map(function (m) {
-    return m.id + ' ' + m.name
-  })
-  return 'Report the tool-layer file permission mode (' + parts.join(' / ')
-    + '). Reports the current mode and counters when called without arguments.'
-}
-
-/**
- * Is `next` a strict widening of `current`?
- *
- * This is the whole test the self-escalation guard applies to a mode SWITCH. It is
- * deliberately about the permission SET, not about "did the mode change":
- *
- *   - Widening (1->4, 3->4, 2->3) is self-escalation and is refused.
- *   - Narrowing (4->1, 3->2) gives up access the agent already had. Refusing it would protect
- *     nothing — an agent that can already read everything is not made dangerous by choosing
- *     to read less — and it would block a genuinely useful containment action.
- *   - Same mode is a no-op and is allowed.
- *
- * Compared field-by-field rather than by mode id, so the check keeps working if the mode set
- * ever changes order or gains a dimension. Mode ids happen to be ordered by widening TODAY,
- * but relying on that would make the check silently wrong the moment that stops being true.
- */
-function isPrivilegeIncrease(current, next) {
-  if (current === undefined || next === undefined) return false
-  const currentSet = [current.workspaceRead, current.workspaceWrite, current['outside-read'], current['outside-write']]
-  const nextSet = [next.workspaceRead, next.workspaceWrite, next['outside-read'], next['outside-write']]
-  let widened = false
-  for (let i = 0; i < currentSet.length; i++) {
-    if (Boolean(nextSet[i]) && !Boolean(currentSet[i])) widened = true
-    // Losing a permission is a narrowing, not an escalation; only the widening loop above
-    // can set the flag.
-  }
-  return widened
-}
-
-/**
- * The refusal a self-escalation attempt through the `permission_mode` TOOL receives.
- *
- * WHY THIS EXISTS AT ALL: the file fence was never enough.
- *
- * `fenceSelfWrite` refuses every write to the mode FILE, and that was treated as covering
- * self-escalation. It did not. The `permission_mode` tool calls `persistMode()` in-process,
- * so it never traverses `tools/pre-execute` and the fence never sees it — measured, not
- * assumed. The tool is registered into the agent's own tool list, which means a model could
- * simply call it and switch itself to mode 4, defeating the entire plugin. The README's
- * claim that "the model cannot raise its own permissions" was false through that one door
- * while remaining true through every other.
- *
- * WHY `tools.guard` AND NOT ANOTHER pre-execute LISTENER: the tools service documents the
- * guard as MONOTONIC — "no guard can force-allow a call another guard denied" — while
- * `tools/pre-execute` is an extensible waterfall. For the control that must not be
- * bypassable, the monotonic seam is the correct one.
- */
-function modeSwitchRefusal(current, requested) {
-  return 'The DSH permission guard refused this mode switch: permission_mode is a reporting '
-    + 'tool for the model. It would move the session from mode ' + current.id + ' (' + current.name + ') to mode '
-    + requested.id + ' (' + requested.name + '), which extends the model\'s own file access. The model cannot raise '
-    + 'its own permissions — that is the CVE-2026-82533 shape. Ask the human to switch modes: the permission '
-    + 'indicator in the composer, an editor on ' + STATE_FILE + ', or the human\'s own tool call.'
-}
-
-/**
- * The workspace the REQUESTING session is judged against, or null when it cannot be known.
- *
- * WHY THIS TAKES A CONTEXT, AND WHY THE SESSION-LIST SCAN WAS DELETED
- *
- * The enforcing half resolves the workspace exactly, from `exec.agent.session.header.cwd`. The
- * reporting half has no execution, so a first attempt read `sessions.list()`. That was wrong in
- * a way only MULTIPLE WORKSPACES expose: `list()` returns EVERY live session — the shipped host
- * uses it for cross-workspace search and tags candidates with `sameWorkspace` — so picking "the
- * first session with a cwd" is a GUESS. Measured with two sessions live:
- *
- *     list [A,B] -> reports workspace A
- *     list [B,A] -> reports workspace B
- *
- * Same session, same code, different answer. The model would be told one workspace's boundary
- * while the fence enforced its own.
- *
- * The prompt assembly context carries the requesting agent: the shipped host builds it as
- * `{ agent, scope: agent }` and its own providers read `context.agent.session.header.cwd`. So
- * the exact value IS available at render time and no heuristic is needed. `scope` is checked
- * too because it is the same object in the shipped implementation.
- *
- * WHEN IT IS STILL UNKNOWN THIS RETURNS null AND THE TEXT SAYS SO. A heuristic fallback here
- * would restore the bug: a confidently wrong workspace is worse than a stated unknown, because
- * the model acts on it. Enforcement is unaffected — it always has the agent, and fails closed
- * when it does not.
- */
+/** The workspace the requesting session is judged against, or null when it cannot be known. */
 function sessionWorkspace(context) {
   const sources = [context && context.agent, context && context.scope]
   for (let i = 0; i < sources.length; i++) {
     const holder = sources[i]
     try {
-      const cwd = holder && holder.session && holder.session.header
-        ? holder.session.header.cwd
-        : undefined
+      const cwd = holder && holder.session && holder.session.header ? holder.session.header.cwd : undefined
       if (typeof cwd === 'string' && cwd !== '') return normalizePath(cwd)
     } catch (error) { /* try the next source */ }
   }
@@ -715,101 +460,62 @@ function sessionWorkspace(context) {
 }
 
 /**
- * The per-turn boundary text injected into the agent's context.
+ * The per-turn boundary text.
  *
- * ENGLISH, and deliberately free of UI wording. This is read by the MODEL, not rendered to
- * a person, so it states the policy instead of naming it: the four mode ids are this
- * plugin's invention and a model cannot act on "mode 3" without the matrix next to it.
- * Localizing this text would be localizing a machine-facing contract.
- *
- * `context` is the prompt assembly context the harness passes to the section callback; it
- * carries the requesting agent. Dropping it was the root cause of the multi-workspace
- * misreport described on `sessionWorkspace`.
+ * It states the ONE thing this plugin decides and says explicitly that writes are not its business, so
+ * a model denied an outside read does not conclude that an outside write is permitted by the same rule.
+ * An unresolvable workspace is STATED, never guessed: a confidently wrong path is worse than a stated
+ * unknown, because the model acts on it.
  */
-function boundaryText(mode, context) {
+function boundaryText(state, context) {
   const workspace = sessionWorkspace(context)
-  const workspaceLine = workspace === null
-    ? ' Workspace = (not resolvable this turn; the fence uses the session\'s own cwd).'
-    : ' Workspace = ' + workspace + '.'
-  return '[permission-guard] Current file permissions: ' + modeLine(mode) + '.'
-    + workspaceLine
-    + ' Workspace: ' + (mode.workspaceRead ? 'readable' : 'not readable') + ', ' + (mode.workspaceWrite ? 'writable' : 'not writable') + ';'
-    + ' Outside: ' + (mode['outside-read'] ? 'readable' : 'not readable') + ', ' + (mode['outside-write'] ? 'writable' : 'not writable') + '.'
-    + ' Out-of-scope file access is denied, and the model cannot raise its own permissions;'
-    + ' ask the human to switch mode when broader access is needed.'
+  const workspaceText = workspace === null
+    ? '(not resolvable this turn; the fence uses the session\'s own cwd)'
+    : workspace
+  const outside = state.outsideRead ? 'READABLE' : 'NOT readable'
+  return '[permission-guard] Session workspace = ' + workspaceText + '.'
+    + ' Reading outside the workspace is ' + outside + '.'
+    + ' This plugin decides ONLY that; writes are confined by the harness sandbox, not by this plugin.'
+    + ' The model cannot change the setting; ask the human to switch it.'
 }
 
 function statusReport(context) {
-  const mode = currentMode()
-  // No context is available in a tool call, so this is usually null; it is stated as such
-  // rather than filled with a guess.
+  const state = currentState()
   const workspace = sessionWorkspace(context)
   return {
     plugin: 'permission-guard',
+    scope: 'outside-read policy only; writes are the harness sandbox\'s business',
     enforcement: 'tool layer (not a kernel boundary)',
     stateFile: STATE_FILE,
-    // Which host APIs this build actually provided. A missing `tools.guard` is not fatal — the file
-    // fence still works — but it DOES disable the mode-switch control, and that must be visible in
-    // a report rather than only in a startup log line nobody reads.
-    capabilities: {
-      toolsGuard: guardArmed,
-      modeSwitchControl: guardArmed
-        ? 'active (the model cannot widen its own mode through permission_mode)'
-        : 'INACTIVE — this DSH build does not expose tools.guard, so permission_mode can switch modes',
-    },
-    // The workspace used to classify paths, and separately the constant used when nothing can
-    // be resolved. Reporting only the constant was misleading for an operator elsewhere;
-    // reporting a guessed value would be worse. Null here means "unknown", explicitly.
+    state: { outsideRead: state.outsideRead, name: stateName(state) },
+    availableStates: modes.STATES.map(function (s) {
+      return { outsideRead: s.outsideRead, name: s.name, nameZh: s.nameZh, summary: s.summary }
+    }),
     workspace: workspace,
     workspaceSource: workspace === null ? 'unresolved (no requesting agent in this call)' : 'requesting agent session header cwd',
     fallbackWorkspace: fallbackWorkspace(),
     fallbackWorkspaceSource: typeof process.env.DSH_PERMISSION_GUARD_WORKSPACE === 'string' && process.env.DSH_PERMISSION_GUARD_WORKSPACE !== ''
       ? 'DSH_PERMISSION_GUARD_WORKSPACE'
-      : 'process.cwd()',
-    // The fence, by contrast, always has an agent and always knows; this says so.
-    enforcementWorkspace: 'exec.agent.session.header.cwd, falling back to ' + fallbackWorkspace() + ' and failing closed',
-    current: {
-      id: mode.id,
-      name: mode.name,
-      summary: mode.summary,
-      workspace: { read: mode.workspaceRead, write: mode.workspaceWrite },
-      outside: { read: mode['outside-read'], write: mode['outside-write'] },
+      : 'os.homedir()',
+    capabilities: {
+      toolsGuard: guardArmed,
+      changeControl: guardArmed
+        ? 'active (the model cannot enable outside reads through this tool)'
+        : 'INACTIVE — this DSH build does not expose tools.guard, so changes are refused entirely',
     },
-    availableModes: modes.PERMISSION_MODES.map(function (m) {
-      return { id: m.id, name: m.name, label: m.label, summary: m.summary }
-    }),
     counters: {
       denials: stats.denied,
       passes: stats.allows,
       shellPathsChecked: stats.shellPathsChecked,
       shellPathsAllowed: stats.shellPathsAllowed,
-      selfWriteBlocks: stats.selfWriteBlocks,
+      selfFlipBlocks: stats.selfFlipBlocks,
     },
-    sync: {
-      armed: syncPush !== null,
-      oldToNew: sync.stats.oldToNew,
-      newToOld: sync.stats.newToOld,
-      echoSuppressed: sync.stats.skippedEcho,
-      sessionPinsIgnored: sync.stats.skippedPin,
-      writeFailures: sync.stats.writeFailures,
-      mapping: {
-        'old:read-only': sync.OLD_TO_NEW['read-only'],
-        'old:workspace-write': sync.OLD_TO_NEW['workspace-write'],
-        'old:danger-full-access': sync.OLD_TO_NEW['danger-full-access'],
-        'new:1': sync.NEW_TO_OLD_SANDBOX[1],
-        'new:2': sync.NEW_TO_OLD_SANDBOX[2],
-        'new:3': sync.NEW_TO_OLD_SANDBOX[3] + ' + approval ' + sync.NEW_TO_OLD_APPROVAL[3],
-        'new:4': sync.NEW_TO_OLD_SANDBOX[4] + ' + approval ' + sync.NEW_TO_OLD_APPROVAL[4],
-      },
-      note: 'old->new follows sandbox/mode session events; new->old writes every live '
-        + 'session (the old model has no deployment-level setter), so a session created '
-        + 'later starts from the composition default until it is switched.',
-    },
+    narrowingsByTool: narrowingsByTool,
     limits: [
       'shell commands are judged by path heuristic only; deliberately obfuscated pwsh can evade the read restriction',
-      'this mode set is unrelated to the upstream SandboxMode, which fences writes only and is a closed three-value vocabulary',
-      'security-guard still blocks writes to the .dsh control plane, mode 4 included',
-      'the mode is process-global, not per-session',
+      'any shell command naming an outside path is refused while outside reads are off, including one that only writes there',
+      'writes are NOT fenced by this plugin: the harness sandbox owns them, so a permissive built-in preset allows outside writes',
+      'the setting is process-global, not per-session',
     ],
     recentDenials: audit.slice(-5),
   }
@@ -817,14 +523,19 @@ function statusReport(context) {
 
 // --------------------------------------------------------------------- plugin
 
+/** The state a request asks for, or undefined when the request does not name a known state. */
+function requestedState(args) {
+  if (args === undefined || args === null) return undefined
+  if (typeof args.outsideRead === 'boolean') return modes.stateByValue(args.outsideRead)
+  return undefined
+}
+
 const plugin = {
   name: 'permission-guard',
   apply(ctx) {
-    ctx0 = ctx
-
-    // Seed the state file on first load so the current mode is visible on disk.
+    // Seed the state file on first load so the current setting is visible on disk.
     try {
-      if (!fs.existsSync(STATE_FILE)) persistMode(currentMode())
+      if (!fs.existsSync(STATE_FILE)) persistState(currentState())
     } catch (error) {
       console.error('[permission-guard] could not seed the state file:', String(error))
     }
@@ -835,133 +546,69 @@ const plugin = {
       return next()
     })
 
-    // Present the four modes in the selector.
-    // NO PROJECTION TAKEOVER HERE. This was tried and reverted.
-    //
-    // The shipped client IS data-driven (`session?.projections.faceOf("permissions")
-    // .getSnapshot()`), so presenting four options looked like a projection swap.
-    // It is not possible:
-    //
-    //   1. The registry refuses to share a key across DIFFERENT stateVersions.
-    //      Registering `permissions` at stateVersion 1 while the upstream
-    //      `dsh-permission-presets` registers it at 2 makes the upstream entry fail
-    //      to load, which takes the WHOLE plugin tree down:
-    //        "session projection key \"permissions\" is already registered at
-    //         stateVersion 1; refusing to share it with stateVersion 2"
-    //      This is a boot failure, not a cosmetic one.
-    //   2. Even with a matching version, the selection path validates against the
-    //      upstream model: selecting writes `sandbox/mode`, an event the sandbox
-    //      policy's invariant plugin rejects for any value outside the closed
-    //      three-value vocabulary.
-    //   3. The upstream selector tracks its selection by deriving it back from
-    //      (sandbox, approval) knob VALUES, so modes 2 and 3 - which differ only in
-    //      outside-read, a dimension the knobs do not have - cannot be distinguished
-    //      at all.
-    //
-    // Four modes therefore need their OWN surface, not the built-in selector.
-    // Enforcement lives in this Host plugin regardless.
-
-    // NO /permission SHADOW HERE EITHER. This was tried and reverted.
-    //
-    // A shadow accepting "1".."4" looked useful, but it only rewrites this
-    // plugin's mode file. It does NOT call `permissionPresets.set()`, so it never
-    // touches the DSH kernel sandbox that gates the actual bash/filesystem
-    // capabilities. `/permission 4` would then read as "full access is on" while
-    // the kernel was still confining writes - a security-relevant lie, which is
-    // worse than the mode simply not being offered.
-    //
-    // Switching the real knobs belongs to the upstream preset service. If a future
-    // version integrates these four modes with the selector, it must go through
-    // `permissionPresets.set()` (or `setSandboxMode` + `setApprovalPolicy`) so the
-    // kernel knobs and this abstraction cannot disagree.
-
-    // Tell the model the current boundary, the same way the upstream sandbox
-    // policy does, so it does not have to discover it by being denied.
-    //
-    // Nothing here may touch ctx.tools. Inside an inject callback the context is a
-    // scoped proxy: reading an undeclared service property throws
-    // `cannot get property "tools" without inject`, which failed this plugin's
-    // load. An earlier draft called `promptCtx.tools.get('read', scope)` to skip
-    // the section when the read tool is absent. Not worth a second hard dependency
-    // for one advisory line, so the section is now unconditional.
+    // Tell the model the boundary it is judged against, so it need not discover it by being denied. The
+    // assembly context MUST be forwarded: it carries the requesting agent, which is the only way to know
+    // WHICH workspace this turn is judged against.
     ctx.inject(['systemPrompt'], function (promptCtx) {
       promptCtx.systemPrompt.section({
         name: 'permission-guard:boundaries',
         order: 0,
-        // The assembly context MUST be forwarded: it carries the requesting agent, which is
-        // the only way to know WHICH workspace this turn is judged against. Dropping it made
-        // the reported workspace a guess once two workspaces were open.
         text: function (context) {
-          return boundaryText(currentMode(), context)
+          return boundaryText(currentState(), context)
         },
       })
     })
 
     ctx.inject(['tools'], function (toolsCtx) {
-      // The mode-switch guard, on the MONOTONIC seam.
-      //
-      // Placed BEFORE the registration below only for readability; registration order does
-      // not affect it. A guard is a synchronous check returning a denial STRING, and the
-      // tools service documents that no later guard can force-allow what one denied — which
-      // is precisely the property a self-escalation control needs.
-      //
-      // It targets `permission_mode` ONLY. The fence for the mode FILE stays on
-      // `tools/pre-execute`, where it can also inspect shell commands; the two seams cover
-      // disjoint paths (tool call vs file write) and neither replaces the other.
+      // The monotonic seam. Enabling outside reads is an escalation and is refused; disabling is
+      // allowed, because giving up access is not one.
       if (typeof toolsCtx.tools.guard === 'function') {
         guardArmed = true
         toolsCtx.tools.guard(function (execution) {
           try {
             if (String(execution && execution.name) !== 'permission_mode') return undefined
-            const args = execution && execution.arguments
-            const requested = args ? args.mode : undefined
-            // Reporting, and a no-op switch, are not escalations.
-            if (requested === undefined || requested === null) return undefined
-            const next = modes.modeById(Number(requested))
-            if (next === undefined) return undefined // the tool body rejects unknown ids
-            const current = currentMode()
-            if (!isPrivilegeIncrease(current, next)) return undefined
-            const entry = {
+            const next = requestedState(execution && execution.arguments)
+            if (next === undefined) return undefined
+            const current = currentState()
+            if (next.outsideRead === current.outsideRead) return undefined
+            if (!next.outsideRead) return undefined // narrowing: allowed
+            stats.selfFlipBlocks += 1
+            audit.push({
               at: new Date().toISOString(),
               tool: 'permission_mode',
-              reason: 'self-escalation guard: the model attempted to widen its own permission mode',
-              from: current.id,
-              to: next.id,
-            }
-            audit.push(entry)
+              reason: 'self-escalation guard: the model attempted to enable outside reads',
+              from: current.outsideRead,
+              to: next.outsideRead,
+            })
             if (audit.length > 200) audit.splice(0, audit.length - 200)
-            stats.selfWriteBlocks += 1
-            console.log('[permission-guard] DENY self-escalation via tool', current.id, '->', next.id)
-            return modeSwitchRefusal(current, next)
+            console.log('[permission-guard] DENY self-flip via tool', current.outsideRead, '->', next.outsideRead)
+            return 'The DSH permission guard refused this change: enabling outside reads extends the model\'s'
+              + ' own file access, and the model cannot raise its own permissions — that is the'
+              + ' CVE-2026-82533 shape. Ask the human to switch it, or to edit ' + STATE_FILE + '.'
           } catch (error) {
-            // FAIL CLOSED, unlike the file fence. An error here must not become permission to
-            // escalate: the recoverable outcome is a refused switch, not a widened sandbox.
-            console.error('[permission-guard] mode-switch guard failed, refusing the switch:', String(error))
-            return 'The DSH permission guard could not evaluate this permission_mode switch, so it refused it (fail-closed).'
+            // FAIL CLOSED, unlike the file fence: the recoverable outcome is a refused change.
+            console.error('[permission-guard] state-switch guard failed, refusing the change:', String(error))
+            return 'The DSH permission guard could not evaluate this change, so it refused it (fail-closed).'
           }
         })
       } else {
-        // LOUD, and no longer merely advisory. The tool refuses switch requests entirely when this
-        // branch is taken (see the execute() guard), so the message states the actual consequence
-        // rather than warning about one that the user might assume was handled.
-        console.error('[permission-guard] tools.guard is unavailable on this DSH build. The '
-          + 'permission_mode tool is therefore REPORT-ONLY: switch requests are refused, because '
-          + 'allowing them would let the model raise its own permissions. The file-access fence '
-          + 'itself is unaffected. To switch modes as a human, use the built-in permission selector '
-          + '(the plugin follows it) or edit the state file (it is watched).')
+        console.error('[permission-guard] tools.guard is unavailable on this DSH build, so the'
+          + ' permission_mode tool is REPORT-ONLY: changes are refused, because allowing them would let the'
+          + ' model raise its own permissions. The read fence itself is unaffected.')
       }
 
       toolsCtx.tools.register({
         name: 'permission_mode',
-        description: toolDescription(),
+        description: 'Report or change whether the model may READ outside the session workspace. Writes are'
+          + ' not covered by this plugin; the harness sandbox confines them. Reports when called without'
+          + ' arguments; enabling outside reads is refused',
         parameters: {
           type: 'object',
           properties: {
-            mode: {
-              type: 'integer',
-              enum: modes.modeIdList(),
-              description: 'Target mode id. Omit to report the current mode and counters. A switch that '
-                + 'WIDENS the model\'s own file access is refused by the self-escalation guard; narrowing is allowed.',
+            outsideRead: {
+              type: 'boolean',
+              description: 'true enables reading outside the workspace, false disables it. Enabling is'
+                + ' REFUSED by the self-escalation guard; disabling is allowed. Omit to report.',
             },
           },
           required: [],
@@ -973,73 +620,52 @@ const plugin = {
           },
         },
         isConcurrencySafe: function () { return true },
-        // The ToolRunContext carries `agent`, so the status report can name the workspace the
-        // CALLER is judged against instead of saying "unknown". It is forwarded, not required:
-        // the report works without it and labels the value as unresolved.
         execute: function (args, exec) {
-          const requested = args && args.mode
-          if (requested === undefined || requested === null) return statusReport(exec)
-
-          // FAIL CLOSED WHEN THE GUARD IS MISSING.
-          //
-          // This was previously a warning plus an active switch: without `tools.guard` the tool
-          // still changed the mode, and the plugin merely reported that it could not stop itself.
-          // That is fail-OPEN for the exact operation this plugin exists to prevent, and a static
-          // analysis service rated it a material weakening (socket.dev, 2026-09-11). The reasoning
-          // was wrong, not just the wording: "the model can widen its own access, but we log it"
-          // is not a control.
-          //
-          // Refusing costs little. An older harness build loses the ability to switch mode through
-          // the MODEL's tool call — which was never a supported operator workflow, since the human
-          // switches from the composer indicator or by editing the state file. What it preserves is
-          // the invariant the package advertises: the model cannot raise its own permissions, on
-          // any build, under any configuration.
-          if (!guardArmed) {
+          const next = requestedState(args)
+          if (next === undefined) return statusReport(exec)
+          const current = currentState()
+          if (next.outsideRead === current.outsideRead) {
             return {
-              action: 'switch',
-              ok: false,
-              refused: true,
-              reason: 'Mode switching through this tool is disabled because this DSH build does not '
-                + 'expose tools.guard, the monotonic seam that prevents a tool call from widening the '
-                + 'model\'s own access. Without it, allowing a switch would let the model raise its own '
-                + 'permissions. Reporting still works. To switch modes as a human, use the built-in '
-                + 'permission selector (the plugin follows it) or edit the state file named below '
-                + '(it is watched).',
-              stateFile: STATE_FILE,
-              capabilities: statusReport(exec).capabilities,
+              action: 'set', ok: true, changed: false,
+              state: { outsideRead: current.outsideRead },
+              boundary: boundaryText(current, exec),
             }
           }
-
-          const found = modes.modeById(Number(requested))
-          if (found === undefined) {
-            return { action: 'switch', ok: false, reason: 'unknown mode id ' + String(requested), availableModes: modes.modeIdList() }
+          if (!guardArmed) {
+            return {
+              action: 'set',
+              ok: false,
+              refused: true,
+              reason: 'Changing this setting through the tool is disabled because this DSH build does not'
+                + ' expose tools.guard, the monotonic seam that prevents a tool call from widening the'
+                + ' model\'s own access. Ask the human to change it.',
+              stateFile: STATE_FILE,
+            }
           }
-          persistMode(found)
-          if (syncPush !== null) syncPush(found, 'permission_mode tool')
-          return { action: 'switch', ok: true, current: { id: found.id, name: found.name, summary: found.summary }, boundary: boundaryText(found, exec) }
+          persistState(next)
+          narrowingsByTool += 1
+          return {
+            action: 'set', ok: true, changed: true,
+            state: { outsideRead: next.outsideRead, name: next.name },
+            boundary: boundaryText(next, exec),
+          }
         },
       })
     })
 
-    // READ-ONLY route the client half fetches for the current mode.
+    // A READ-ONLY route for the client half.
     //
-    // Why HTTP and not host RPC: `harness.handle` + `host.call` exist only inside
-    // the DYNAMIC plugin runner. Its host side keeps a per-run handler Map
-    // (`handlers: new Map()` on `plugin.run`) and routes back by
-    // `pluginRunId/packageId`; a profile plugin has no handle into it, and across
-    // 11342 shipped code files only the four dynamic-runner files mention
-    // `host.call` at all. So the seam is closed by design, and the web server is
-    // the supported surface a profile plugin CAN own.
+    // There is deliberately NO write route. HTTP never passes through `tools/pre-execute`, so a write
+    // route would be reachable by the model's own shell and would hand it the very switch this plugin
+    // refuses to let it flip — the fence above exists for that reason, and a write route would route
+    // around it. How the UI switch writes is a separate, still-open question.
     //
-    // SAFETY: GET only, and it discloses nothing that is not already visible in the
-    // UI. There is deliberately NO write route. A POST route would be reachable by
-    // the agent's own shell (HTTP never passes through `tools/pre-execute`), i.e. it
-    // would reopen exactly the self-escalation hole `fenceSelfWrite` exists to
-    // close. The UI is therefore a status display, not a control.
+    // The payload carries the state and NOTHING about where the process runs: a status surface must not
+    // double as a filesystem probe.
     ctx.inject(['webServer'], function (webCtx) {
       webCtx.webServer.register({
         kind: 'exact',
-        path: '/permission-guard/mode',
+        path: '/permission-guard/state',
         handler: function (req, res) {
           if (req.method !== 'GET' && req.method !== 'HEAD') {
             res.statusCode = 405
@@ -1047,245 +673,17 @@ const plugin = {
             res.end('{"error":"method not allowed"}')
             return
           }
-          const mode = currentMode()
-          // NO FILESYSTEM PATHS IN THE RESPONSE.
-          //
-          // This payload used to include `fallbackWorkspace` — an absolute path from the server's
-          // machine. A static analysis service flagged it as path disclosure, and it was right on
-          // two counts. The disclosure itself is real: the route is reachable by anything that can
-          // reach the loopback web server, including the model's own shell via HTTP (which never
-          // passes through `tools/pre-execute`). And the field was pointless on top of that — the
-          // CLIENT reads `id` and derives its own localized labels, so nothing consumed it.
-          //
-          // The rule this endpoint now follows: it returns the mode, and nothing about WHERE the
-          // process runs. A status surface should not double as a filesystem probe.
-          const payload = JSON.stringify({
-            id: mode.id,
-            name: mode.name,
-            summary: mode.summary,
-          })
+          const state = currentState()
           res.statusCode = 200
           res.setHeader('content-type', 'application/json; charset=utf-8')
           res.setHeader('cache-control', 'no-store')
-          res.end(payload)
+          res.end(JSON.stringify({ outsideRead: state.outsideRead, name: stateName(state) }))
         },
       })
-      console.log('[permission-guard] mode route registered at /permission-guard/mode')
+      console.log('[permission-guard] state route registered at /permission-guard/state')
     })
 
-    // ---------------------------------------------------------------- old <-> new sync
-    //
-    // The two permission models are independent, and this makes them follow each
-    // other. Mapping and the per-session caveat are documented in ./sync.js.
-    //
-    // Loop safety: both handlers write the other side, so every programmatic write
-    // runs inside `sync.apply()` (a depth-counted guard) and the handlers ignore
-    // events observed while that guard is active. Without it each write would be
-    // seen as an external change and echoed forever.
-    ctx.inject(['sessions', 'approval'], function (syncCtx) {
-      const sessions = syncCtx.sessions
-      const approval = syncCtx.approval
-
-      /** new -> old: push the current mode onto every live session and agent. */
-      function applyToOld(mode, reason) {
-        const sandbox = sync.NEW_TO_OLD_SANDBOX[mode.id]
-        const policy = sync.NEW_TO_OLD_APPROVAL[mode.id]
-        const targets = sessions.list()
-        let touched = 0
-        let failed = 0
-        for (let i = 0; i < targets.length; i++) {
-          const session = targets[i]
-          try {
-            // Skip a session already carrying this exact mode: append would be a
-            // no-op event and would only add log noise.
-            if (sandboxPolicyOverride(session) === sandbox) continue
-            session.append('sandbox/mode', { mode: sandbox })
-            touched += 1
-          } catch (error) {
-            failed += 1
-            sync.report('new->old sandbox failed', String(error))
-          }
-          try {
-            const agent = agentsOf(syncCtx, session)
-            if (agent !== undefined && approval.effectivePolicyOf !== undefined) { /* no-op */ }
-            if (agent !== undefined) approval.setPolicy(agent, policy)
-          } catch (error) {
-            failed += 1
-            sync.report('new->old approval failed', String(error))
-          }
-        }
-        sync.stats.newToOld += 1
-        sync.stats.writeFailures += failed
-        sync.report('new->old', 'mode ' + mode.id + ' -> sandbox=' + sandbox + ' approval=' + policy
-          + ' sessions=' + targets.length + ' updated=' + touched + ' failed=' + failed
-          + ' (' + reason + ')')
-      }
-
-      /** The session's own last `sandbox/mode` event, if any. */
-      function sandboxPolicyOverride(session) {
-        try {
-          const events = session.snapshotEvents()
-          for (let i = events.length - 1; i >= 0; i--) {
-            if (events[i].type === 'sandbox/mode') return events[i].data && events[i].data.mode
-          }
-        } catch (error) { /* fall through: treat as no override */ }
-        return undefined
-      }
-
-      /** The live agent for a session, needed by approval.setPolicy. */
-      function agentsOf(c, session) {
-        try {
-          const agents = c.get('agents')
-          if (agents === undefined || typeof agents.get !== 'function') return undefined
-          return agents.get(session.id)
-        } catch (error) {
-          return undefined
-        }
-      }
-
-      // old -> new: follow the kernel sandbox mode when the OPERATOR changes it.
-      //
-      // The hard part is that not every `sandbox/mode` event is a user action. The
-      // upstream preset service pins every new session:
-      //
-      //   ctx.on("session/created", (session) => this.pinInitialPermission(session))
-      //   pinInitialPermission(session) {
-      //     ...
-      //     setSandboxMode(session, spec.sandbox)        // appends sandbox/mode
-      //   }
-      //   // and for a session with no override:
-      //   if (sandbox === null) setSandboxMode(session, this.ctx.shell.sandboxMode)
-      //
-      // `ctx.shell.sandboxMode` is the DEPLOYMENT default (workspace-write), not this
-      // plugin's mode. So every new session appended `sandbox/mode=workspace-write`,
-      // which maps to new 2, which OVERWROTE a hand-set 4 the moment any session was
-      // created. That was a real bug: the operator set 4 and it silently became 2.
-      //
-      // A session's FIRST sandbox/mode event is always that pin, so it is skipped.
-      // Genuine changes (the operator switching presets, which calls
-      // `session.append('sandbox/mode', ...)` on an existing session) arrive as a
-      // later event and still sync. Documented limitation: a change made before a
-      // session has any pinned event is indistinguishable from the pin and is
-      // skipped — visible in the log, never silent.
-      const pinned = new Set()
-      ctx.on('session/event', function (session, event) {
-        try {
-          if (sync.inApply()) { sync.stats.skippedEcho += 1; return }
-          if (event === undefined || event.type !== 'sandbox/mode') return
-          const key = session === undefined || session.id === undefined ? '?' : String(session.id)
-          if (!pinned.has(key)) {
-            pinned.add(key)
-            sync.stats.skippedPin += 1
-            sync.report('old->new skipped', 'session ' + key + ' initial pin (' + (event.data && event.data.mode) + ') — not an operator change')
-            return
-          }
-          const oldMode = event.data && event.data.mode
-          const mapped = sync.OLD_TO_NEW[oldMode]
-          if (mapped === undefined) { sync.stats.skippedUnknown += 1; return }
-          const mode = modes.modeById(mapped)
-          if (mode === undefined) return
-          if (currentMode().id === mode.id) return
-          persistMode(mode)
-          sync.stats.oldToNew += 1
-          sync.report('old->new', 'sandbox=' + oldMode + ' -> mode ' + mode.id + '「' + mode.name + '」')
-        } catch (error) {
-          sync.report('old->new failed', String(error))
-        }
-      })
-
-      // Expose the reverse direction so the mode switch points above can call it.
-      syncCtx.effect(function () {
-        syncPush = function (mode, reason) {
-          if (sync.inApply()) return
-          sync.apply(function () { applyToOld(mode, reason) })
-        }
-        return function () { syncPush = null }
-      }, 'permission-guard: new->old push')
-
-      // ------------------------------------------------------------ external file edits
-      //
-      // THE PATH THAT HAD NO HOOK, AND THE REPORTED "new -> old does not work".
-      //
-      // new -> old used to fire only from the `permission_mode` tool. But the UI indicator is a
-      // read-only display BY DESIGN (a write route reachable over loopback would be a
-      // self-escalation path, since HTTP never passes through tools/pre-execute), so the documented
-      // human procedure is to edit the state file. That procedure changed the new mode and pushed
-      // NOTHING, because no code runs on a file edit.
-      //
-      // Field report: oldToNew=2, newToOld=0, echoSuppressed=0 — the operator had switched twice
-      // through the built-in selector (which the session/event hook catches) and had set the new
-      // mode by editing the file (which nothing caught). Not a broken direction; a missing trigger.
-      //
-      // A human edit is authoritative and is pushed even when it WIDENS, unlike a model-initiated
-      // switch. That is not a hole: the state file is protected by the self-escalation fence, and a
-      // widening edit is only reachable by someone who can write the file — i.e. the operator. The
-      // guard that refuses a model's widening tool call is aimed at the TOOL path, which is
-      // untouched by this.
-      //
-      // Lossy-rounding guard: 3 and 2 both map to `workspace-write`, so changing 3 -> 2 alters no
-      // kernel state. The push is skipped when the kernels already agree, which also prevents the
-      // pointless log line and the wasted session events.
-      let lastPushed = null
-      let watchTimer = null
-
-      function sandboxAlreadyApplied(mode) {
-        const sandbox = sync.NEW_TO_OLD_SANDBOX[mode.id]
-        const live = sessions.list()
-        if (!Array.isArray(live) || live.length === 0) return false
-        for (let i = 0; i < live.length; i++) {
-          if (sandboxPolicyOverride(live[i]) !== sandbox) return false
-        }
-        return true
-      }
-
-      function onStateFileChanged() {
-        try {
-          if (sync.inApply()) return                       // our own write; already applied
-          const mode = loadMode()
-          if (lastPushed !== null && mode.id === lastPushed) return
-          const previous = lastPushed
-          lastPushed = mode.id
-          if (sandboxAlreadyApplied(mode)) {
-            sync.report('file->old skipped', 'mode ' + mode.id + ' already applied to the kernel'
-              + (previous === null ? ' (initial read)' : ''))
-            return
-          }
-          sync.report('file->old', 'state file changed' + (previous === null ? ' (initial read)' : '')
-            + ' -> mode ' + mode.id + '; pushing to the kernel')
-          if (syncPush !== null) syncPush(mode, 'state file changed by the operator')
-        } catch (error) {
-          sync.report('file->old failed', String(error))
-        }
-      }
-
-      syncCtx.effect(function () {
-        let watcher = null
-        const directory = path.dirname(STATE_FILE)
-        const base = path.basename(STATE_FILE)
-        try {
-          // The DIRECTORY is watched, not the file. Many editors save by writing a temporary file
-          // and renaming it over the original, which breaks a watch placed on the file itself. A
-          // directory watch survives the replacement, and the basename filter keeps it specific.
-          watcher = fs.watch(directory, { persistent: false }, function (eventType, filename) {
-            if (filename !== null && String(filename) !== base) return
-            if (watchTimer !== null) clearTimeout(watchTimer)
-            watchTimer = setTimeout(onStateFileChanged, 150)
-          })
-        } catch (error) {
-          console.error('[permission-guard] could not watch the state file; editing it will no '
-            + 'longer sync to the kernel sandbox:', String(error))
-        }
-        return function () {
-          if (watchTimer !== null) { clearTimeout(watchTimer); watchTimer = null }
-          if (watcher !== null) watcher.close()
-        }
-      }, 'permission-guard: state-file edit -> old')
-
-      sync.report('armed', 'old->new via session/event; new->old via the tool, and via state-file '
-        + 'edits (watched); new->old applies to every live session')
-    })
-
-    console.log('[permission-guard] active; state file =', STATE_FILE, '; mode =', currentMode().id)
+    console.log('[permission-guard] active; state file =', STATE_FILE, '; outsideRead =', currentState().outsideRead)
   },
 }
 

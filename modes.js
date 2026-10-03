@@ -1,160 +1,97 @@
 'use strict'
 
 /**
- * The four permission modes from D:\DeepSeek Harness\权限设置.txt, expressed as
- * a read/write matrix over the session workspace.
+ * The two states this plugin distinguishes, and the tool sets it fences.
  *
- *   1 Workspace read    workspace r          outside -
- *   2 Workspace write   workspace r/w        outside -
- *   3 Outside readable  workspace r/w        outside r
- *   4 Full access       workspace r/w        outside r/w
+ * WHY THIS IS ONE BOOLEAN AND NOT TWO MODE NUMBERS
  *
- * `name`/`summary` are ENGLISH because they are persisted and displayed: `name` is
- * written into permissions.json and `summary` appears in the agent-facing status
- * report. `nameZh` carries the original Chinese display name so a translation exists
- * in exactly one place. END-USER UI TEXT IS NOT HERE — the client owns that, keyed by
- * mode id, so a label can change without touching the enforcement path.
+ * The earlier design had four numbered modes covering two axes. It is now ONE axis — may the model
+ * read outside the workspace — because WRITES ARE THE HARNESS'S OWN BUSINESS. The built-in sandbox
+ * already confines them per session, so a second opinion about writes only produced a state that
+ * could disagree with the kernel's. This plugin therefore adds exactly the dimension the kernel does
+ * not have, and nothing else.
  *
- * NOTE ON THE UPSTREAM VOCABULARY. The harness's own SandboxMode is a CLOSED
- * three-value set (read-only / workspace-write / danger-full-access) enforced in
- * three independent places: the policy config schema (`z.literal`), runtime
- * validation against SANDBOX_MODES, and an invariant companion plugin that fails
- * any unrecognised `sandbox/mode` session event. Reads are never fenced by it at
- * all - the bundled fs sandbox documents "reads pass through untouched". So these
- * four modes cannot be expressed as upstream sandbox modes; they are enforced by
- * this plugin at the tool layer, and the two "outside read" modes are the part
- * with no upstream equivalent.
+ * The state is a NAMED BOOLEAN rather than `mode: 1|2` for a specific safety reason. The old ids
+ * meant something different: old `2` was "Workspace write", i.e. outside NOT readable, while a new
+ * `2` would mean "Outside readable". A state file surviving an upgrade would then have been read as
+ * the OPPOSITE permission and would have silently granted outside reads. A field whose name states
+ * its meaning cannot be misread that way, and its absence is unambiguous.
+ *
+ * WHY THE KERNEL CANNOT EXPRESS THIS. The harness's SandboxMode is a closed three-value set
+ * (read-only / workspace-write / danger-full-access) and it fences WRITES ONLY — the bundled fs
+ * sandbox documents that reads pass through untouched in every mode. "Outside readable" is therefore
+ * not expressible upstream at all, which is the entire reason this plugin exists.
  */
 
-const OUTSIDE_READ = 'outside-read'
-const OUTSIDE_WRITE = 'outside-write'
-
-const PERMISSION_MODES = [
+/**
+ * Both states grant the same thing inside the workspace; they differ only outside it.
+ *
+ * The field is named `outsideRead` — the SAME name the state file uses and the same name every
+ * consumer reads. An earlier draft called it `value`, while the plugin read `.outsideRead`: the
+ * mismatch made every comparison `undefined === true`, which silently disabled the widening guard and
+ * wrote a state file with the field missing entirely. One concept, one name.
+ */
+const STATES = [
   {
-    id: 1,
-    name: 'Workspace read',
-    nameZh: '工作区查看',
-    label: 'workspace-view',
-    workspaceRead: true,
-    workspaceWrite: false,
-    [OUTSIDE_READ]: false,
-    [OUTSIDE_WRITE]: false,
-    summary: 'workspace: read; outside: none',
+    outsideRead: false,
+    name: 'Workspace only',
+    nameZh: '仅工作区',
+    summary: 'workspace: readable; outside: not readable',
   },
   {
-    id: 2,
-    name: 'Workspace write',
-    nameZh: '工作区内修改',
-    label: 'workspace-write-only',
-    workspaceRead: true,
-    workspaceWrite: true,
-    [OUTSIDE_READ]: false,
-    [OUTSIDE_WRITE]: false,
-    summary: 'workspace: read/write; outside: none',
-  },
-  {
-    id: 3,
+    outsideRead: true,
     name: 'Outside readable',
-    nameZh: '非工作区可读',
-    label: 'outside-readable',
-    workspaceRead: true,
-    workspaceWrite: true,
-    [OUTSIDE_READ]: true,
-    [OUTSIDE_WRITE]: false,
-    summary: 'workspace: read/write; outside: read',
-  },
-  {
-    id: 4,
-    name: 'Full access',
-    nameZh: '完全权限',
-    label: 'full-access',
-    workspaceRead: true,
-    workspaceWrite: true,
-    [OUTSIDE_READ]: true,
-    [OUTSIDE_WRITE]: true,
-    summary: 'workspace: read/write; outside: read/write',
+    nameZh: '外部可读',
+    summary: 'workspace: readable; outside: readable',
   },
 ]
+
+/**
+ * Outside reads are DENIED until an operator allows them.
+ *
+ * The safe default: this plugin exists to ADD a restriction, so a fresh install must not hand out
+ * access nobody asked for. It is also the answer when the state file is missing or unreadable —
+ * the case that matters, because a fail-open default there would widen access exactly when the
+ * configuration is broken.
+ */
+const DEFAULT_OUTSIDE_READ = false
+
+/** Resolve a state from a stored value; undefined when the value is not a known state. */
+function stateByValue(value) {
+  for (let i = 0; i < STATES.length; i++) {
+    if (STATES[i].outsideRead === Boolean(value)) return STATES[i]
+  }
+  return undefined
+}
 
 /** Tools that read a single path. */
 const PATH_READ_TOOLS = new Set(['read', 'read_image'])
 
-/** Tools that mutate a single path. */
+/**
+ * Tools that write a single path.
+ *
+ * Still listed, but no longer fenced for their path policy: only the STATE FILE is protected (by the
+ * self-escalation fence), and every other write is left to the harness sandbox. They are listed so
+ * that fence can find their target argument.
+ */
 const PATH_WRITE_TOOLS = new Set(['write', 'edit'])
 
 /** Tools that read a directory tree, optionally scoped by `path`. */
 const TREE_READ_TOOLS = new Set(['glob', 'grep'])
 
-/** Shell tools, fenced by best-effort path extraction from the command text. */
+/** Shell tools, fenced for READS by best-effort path extraction from the command text. */
 const SHELL_TOOLS = new Set(['pwsh', 'bash'])
 
-/** `str_replace_editor` carries its target in `path` and mutates it. */
+/** `str_replace_editor` carries its target in `path`. */
 const STR_REPLACE_TOOL = 'str_replace_editor'
 
-function modeById(id) {
-  for (let i = 0; i < PERMISSION_MODES.length; i++) {
-    if (PERMISSION_MODES[i].id === id) return PERMISSION_MODES[i]
-  }
-  return undefined
-}
-
-function modeByLabel(label) {
-  for (let i = 0; i < PERMISSION_MODES.length; i++) {
-    if (PERMISSION_MODES[i].label === label) return PERMISSION_MODES[i]
-  }
-  return undefined
-}
-
-function modeIdList() {
-  return PERMISSION_MODES.map(function (m) { return m.id })
-}
-
-/**
- * Map an upstream SandboxMode onto the closest permission mode.
- *
- * Needed because the two vocabularies are NOT isomorphic: upstream has three
- * write-only modes, this set has four read/write modes. The mapping is lossy by
- * construction — `workspace-write` cannot say whether outside reads are allowed,
- * so it resolves to the mode granting exactly what upstream grants (mode 2), and
- * a lossless four-mode selection must be recorded some other way.
- *
- * @param sandbox - read-only / workspace-write / danger-full-access.
- * @returns the closest permission mode, or undefined for an unknown value.
- */
-function modeBySandbox(sandbox) {
-  if (sandbox === 'read-only') return modeById(2)
-  if (sandbox === 'workspace-write') return modeById(2)
-  if (sandbox === 'danger-full-access') return modeById(4)
-  return undefined
-}
-
-/** The upstream SandboxMode that would express this mode's WRITE half, where one exists. */
-function sandboxForMode(mode) {
-  if (mode.id === 4) return 'danger-full-access'
-  if (mode.id === 1) return 'read-only'
-  return 'workspace-write'
-}
-
-/**
- * The starting mode when no state file exists.
- *
- * Exported so the test suite reads the value instead of repeating the literal. This default changed
- * from 1 to 2 when the plugin became distributable, and the suite still asserted 1 in three places —
- * a number duplicated in tests is a number guaranteed to disagree with the code eventually.
- */
-const DEFAULT_MODE_ID = 2
-
 module.exports = {
-  DEFAULT_MODE_ID,
-  PERMISSION_MODES,
+  STATES,
+  DEFAULT_OUTSIDE_READ,
+  stateByValue,
   PATH_READ_TOOLS,
   PATH_WRITE_TOOLS,
   TREE_READ_TOOLS,
   SHELL_TOOLS,
   STR_REPLACE_TOOL,
-  modeById,
-  modeByLabel,
-  modeIdList,
-  modeBySandbox,
-  sandboxForMode,
 }

@@ -5,112 +5,68 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 
 		/**
-		 * Client half of the permission guard: a READ-ONLY mode indicator in the
-		 * composer tool row.
+		 * Client half: the outside-read SWITCH in the composer, and the state it mirrors.
 		 *
-		 * It is read-only on purpose. Switching modes must go through the host tool or
-		 * the state file, because the only write channel available over HTTP would
-		 * bypass `tools/pre-execute` and hand the agent a self-escalation route.
+		 * WHAT IT SHOWS. One boolean: may the model read outside the session workspace. That is the only
+		 * thing the plugin decides. Writes are the harness sandbox's business and are deliberately not
+		 * represented here — showing a write control would imply this plugin owns write access, which it
+		 * does not.
 		 *
-		 * Data comes from the host's own HTTP route, not host RPC: `harness.handle` /
-		 * `host.call` exist only inside the dynamic plugin runner, whose host side keeps
-		 * a per-run handler map. The web server is the surface a profile plugin can own.
+		 * IT IS STILL READ-ONLY, AND THAT IS THE OPEN QUESTION, NOT AN OVERSIGHT. Flipping it needs a
+		 * channel the MODEL cannot reach, because the model gaining outside reads is exactly the
+		 * escalation this plugin exists to refuse. The read-only status route below is deliberately GET
+		 * only: HTTP never passes through `tools/pre-execute`, so a write route would be reachable by the
+		 * model's own shell and would route around the state file's fence. Candidate channels (a host
+		 * method over the package-private client→host RPC, or the harness's own config editor) are not
+		 * yet verified for a profile plugin, so this control reflects the setting and says how to change
+		 * it, rather than pretending to be a working switch.
 		 *
-		 * The outer `__ModuleLoader__.load({ id, factory })` wrapper is REQUIRED, and
-		 * `id` must equal this package's name: a bundle that loads without calling the
-		 * loader is rejected with
-		 *   "loaded without registering <id> via __ModuleLoader__.load"
+		 * The outer `__ModuleLoader__.load({ id, factory })` wrapper is REQUIRED, and `id` must equal the
+		 * package name: a bundle that loads without calling the loader is rejected.
 		 */
 
 		const React = require("react");
 
 		const SLOT = "conversation.input.left";
-		const ENTRY_ID = "permission-guard.mode";
-		const MODE_URL = "/permission-guard/mode";
+		const ENTRY_ID = "permission-guard.outside-read";
+		const STATE_URL = "/permission-guard/state";
 
 		/**
-		 * Display strings, keyed by language.
-		 *
-		 * WHY A LOCAL TABLE AND NOT `ctx.locale.register`
-		 *
-		 * The `locale` service offers a real dictionary registry (`register(ns, dicts)` /
-		 * `register(ns, locale, dict)` / `bind(ns)`). Using it would hand the built-in
-		 * language switcher ownership of these strings, which is attractive.
-		 *
-		 * It is declined for one reason: this UI is a single read-only indicator with six
-		 * strings. Registering into a SHARED namespace risks a duplicate-(ns, locale)
-		 * throw, and the typed form demands a dictionary for EVERY shipped locale — a
-		 * guaranteed drift bug the next time a language is added upstream. A local table
-		 * cannot fail at runtime; the only thing given up is third-party translation of
-		 * six strings.
-		 *
-		 * Following the locale and owning the dictionary are separable decisions, and only
-		 * the second is declined: the active language is still READ from the service, so
-		 * this follows the system/browser language and re-renders on a live switch.
-		 *
-		 * Mode NAMES ARE NOT DUPLICATED HERE. They live in modes.js on the host and in the
-		 * state file in English; this table only maps a mode id to its localized display
-		 * text. That keeps one source for the mode set and one source for its translation.
+		 * Display strings, keyed by language. `outsideRead` is the state the switch reflects; `note`
+		 * names only mechanisms that exist — an earlier version pointed at a tool the model cannot reach.
 		 */
-		// The note names ONLY mechanisms that actually exist.
-		//
-		// It used to say "use the permission_mode tool", which was wrong in practice: the tool is
-		// registered on the host, but it never reaches the model's tool list, so anyone following that
-		// advice finds no such tool. Pointing at something unusable is worse than saying less.
-		//
-		// Both surviving routes work because the plugin keeps the harness sandbox in step in both
-		// directions: the built-in selector changes the harness mode and the plugin follows it, and
-		// editing the file is watched and pushed to the harness.
 		const EN = {
-			label: "Permission",
+			on: "Outside read",
+			off: "Outside read",
+			onDetail: "The model may read outside the workspace.",
+			offDetail: "The model may not read outside the workspace.",
+			note: "Read-only display. Change outsideRead in permissions.json beside the installed plugin; it applies immediately.",
+			tooltip: "May the model read outside the session workspace?",
 			readFailed: "Read failed: ",
-			note: "Read-only display. Switch with the built-in permission selector, or by editing permissions.json.",
-			tooltip: "Current file-permission mode",
-			modes: {
-				1: { name: "Workspace read", detail: "workspace: read; outside: none" },
-				2: { name: "Workspace write", detail: "workspace: read/write; outside: none" },
-				3: { name: "Outside readable", detail: "workspace: read/write; outside: read" },
-				4: { name: "Full access", detail: "workspace: read/write; outside: read/write" },
-			},
+			stateOn: "ON",
+			stateOff: "OFF",
 		};
 
 		const ZH = {
-			label: "权限",
+			on: "外部读取",
+			off: "外部读取",
+			onDetail: "模型可以读取工作区之外的内容。",
+			offDetail: "模型不能读取工作区之外的内容。",
+			note: "只读显示。请修改插件旁 permissions.json 里的 outsideRead，改动立即生效。",
+			tooltip: "模型是否可以读取会话工作区之外的内容？",
 			readFailed: "读取失败：",
-			note: "只读显示。切换档位请用内置的权限选择器，或编辑 permissions.json。",
-			tooltip: "当前文件权限档位",
-			modes: {
-				1: { name: "工作区查看", detail: "工作区可读，非工作区不可读" },
-				2: { name: "工作区内修改", detail: "工作区可读/写，非工作区不可读" },
-				3: { name: "非工作区可读", detail: "工作区可读/写，非工作区可读" },
-				4: { name: "完全权限", detail: "工作区可读/写，非工作区可读/写" },
-			},
+			stateOn: "开",
+			stateOff: "关",
 		};
 
-		const MODE_IDS = [1, 2, 3, 4];
-
-		/**
-		 * Pick a table for a BCP 47-style tag.
-		 *
-		 * Prefix matching, not equality: the snapshot's `active` may be `zh-CN`,
-		 * `zh-Hans`, or a bare `zh`, and requiring an exact key would silently fall back
-		 * to English for every Chinese user. Unmatched tags fall back to English, the
-		 * documented terminal language of DSH's own fallback chain.
-		 */
+		/** Prefix match, not equality: `zh-CN`, `zh-Hant` and a bare `zh` must all resolve to Chinese. */
 		function dictFor(tag) {
 			const value = typeof tag === "string" ? tag.toLowerCase() : "";
 			if (value.indexOf("zh") === 0) return ZH;
 			return EN;
 		}
 
-		/**
-		 * Resolve the table, following the harness locale when available.
-		 *
-		 * `navigator` is the second source on purpose: it preserves "follow the system
-		 * language" before the locale service resolves and in any embedding where the
-		 * service is absent. Both are read defensively — a client bundle must not assume
-		 * a browser global exists.
-		 */
+		/** Follow the harness locale when it is available, then the browser, then English. */
 		function resolveDict(locale) {
 			if (locale !== undefined && locale !== null) {
 				try {
@@ -118,23 +74,24 @@ window.__ModuleLoader__.load({
 					if (snapshot !== undefined && snapshot !== null && typeof snapshot.active === "string") {
 						return dictFor(snapshot.active);
 					}
-				} catch (error) { /* fall through to navigator */ }
+				} catch (error) { /* fall through */ }
 			}
 			try {
 				if (typeof navigator !== "undefined" && navigator !== null) {
 					const tagged = navigator.language || (navigator.languages && navigator.languages[0]);
 					if (typeof tagged === "string") return dictFor(tagged);
 				}
-			} catch (error) { /* fall through to the default */ }
+			} catch (error) { /* fall through */ }
 			return EN;
 		}
 
 		const S = {
-			wrap: { position: "relative", display: "inline-block" },
+			wrap: { position: "relative", display: "inline-flex", alignItems: "center", gap: "6px" },
+			label: { fontSize: "12px", lineHeight: "18px", whiteSpace: "nowrap" },
 			button: {
 				display: "inline-flex",
 				alignItems: "center",
-				gap: "4px",
+				gap: "6px",
 				padding: "2px 8px",
 				borderRadius: "6px",
 				border: "1px solid var(--dsw-border, rgba(128,128,128,0.35))",
@@ -145,57 +102,78 @@ window.__ModuleLoader__.load({
 				cursor: "pointer",
 				whiteSpace: "nowrap",
 			},
+			track: {
+				position: "relative",
+				display: "inline-block",
+				width: "28px",
+				height: "16px",
+				borderRadius: "8px",
+				transition: "background 120ms linear",
+				flex: "0 0 auto",
+			},
+			knob: {
+				position: "absolute",
+				top: "2px",
+				width: "12px",
+				height: "12px",
+				borderRadius: "50%",
+				background: "var(--dsw-surface, Canvas)",
+				transition: "left 120ms linear",
+			},
 			panel: {
 				position: "absolute",
 				bottom: "100%",
 				left: 0,
 				marginBottom: "6px",
-				minWidth: "250px",
-				padding: "6px",
+				minWidth: "260px",
+				padding: "8px 10px",
 				borderRadius: "8px",
 				border: "1px solid var(--dsw-border, rgba(128,128,128,0.35))",
 				background: "var(--dsw-surface, Canvas)",
 				color: "inherit",
 				boxShadow: "0 6px 24px rgba(0,0,0,0.22)",
 				zIndex: 40,
+				fontSize: "12px",
+				lineHeight: "17px",
 			},
-			row: { padding: "4px 8px", borderRadius: "6px", fontSize: "12px", lineHeight: "16px" },
-			rowActive: { background: "var(--dsw-accent-weak, rgba(128,128,128,0.18))" },
-			detail: { display: "block", opacity: 0.65, fontSize: "11px", marginTop: "1px" },
-			note: { display: "block", padding: "6px 8px 2px", fontSize: "11px", opacity: 0.7 },
-			error: { display: "block", padding: "2px 8px", fontSize: "11px", color: "var(--dsw-danger, #d33)" },
+			detail: { display: "block", marginBottom: "4px" },
+			note: { display: "block", opacity: 0.7, fontSize: "11px" },
+			error: { display: "block", marginTop: "4px", fontSize: "11px", color: "var(--dsw-danger, #d33)" },
 		};
 
 		/**
-		 * @param props.locale - the `locale` client service, or undefined. Undefined is a
-		 * supported state: the indicator still renders, using `navigator` then English.
+		 * @param props.locale - the `locale` client service, or undefined. Undefined is supported: the
+		 * control still renders, using `navigator` then English.
 		 */
-		function ModeIndicator(props) {
+		function OutsideReadSwitch(props) {
 			const locale = props && props.locale;
-			const [state, setState] = React.useState({ ready: false, id: null, error: null });
+			const [state, setState] = React.useState({ ready: false, outsideRead: null, error: null });
 			const [open, setOpen] = React.useState(false);
-			// Bumped on a locale change purely to force a re-render. The active language is
-			// read during render instead of being copied into state, so there is no stale
-			// copy to go out of sync with the service.
+			// Bumped on a locale change to force a re-render; the active language is read during render
+			// instead of being copied into state, so there is no stale copy.
 			const [, setRevision] = React.useState(0);
 
 			React.useEffect(() => {
 				let alive = true;
 				function load() {
-					fetch(MODE_URL, { headers: { accept: "application/json" } })
+					fetch(STATE_URL, { headers: { accept: "application/json" } })
 						.then((response) => response.ok ? response.json() : Promise.reject(new Error("HTTP " + response.status)))
 						.then((value) => {
 							if (!alive) return;
-							setState({ ready: true, id: value && typeof value.id === "number" ? value.id : null, error: null });
+							setState({
+								ready: true,
+								outsideRead: value && typeof value.outsideRead === "boolean" ? value.outsideRead : null,
+								error: null,
+							});
 						})
 						.catch((error) => {
 							if (!alive) return;
-							setState({ ready: true, id: null, error: String(error && error.message ? error.message : error) });
+							setState({ ready: true, outsideRead: null, error: String(error && error.message ? error.message : error) });
 						});
 				}
 				load();
-				// The mode can change from the tool or the file while this page stays open and
-				// there is no push channel, so re-read when the window regains focus.
+				// No push channel exists, so re-read when the window regains focus: the setting can change
+				// while this page stays open.
 				window.addEventListener("focus", load);
 				return () => {
 					alive = false;
@@ -203,9 +181,6 @@ window.__ModuleLoader__.load({
 				};
 			}, []);
 
-			// Follow a live locale switch. Without this the indicator keeps the language it
-			// rendered with until the next unrelated re-render, which looks like the setting
-			// was ignored.
 			React.useEffect(() => {
 				if (locale === undefined || locale === null || typeof locale.subscribe !== "function") return undefined;
 				let dispose = null;
@@ -218,43 +193,49 @@ window.__ModuleLoader__.load({
 			}, [locale]);
 
 			const t = resolveDict(locale);
-			const current = MODE_IDS.indexOf(state.id) !== -1 ? t.modes[state.id] : null;
-			const label = current
-				? String(state.id) + " " + current.name
-				: (state.ready ? "?" : "…");
-
-			const rows = MODE_IDS.map((id) => React.createElement("div", {
-				key: String(id),
-				style: id === state.id ? Object.assign({}, S.row, S.rowActive) : S.row,
-			},
-				String(id) + " " + t.modes[id].name,
-				React.createElement("span", { style: S.detail }, t.modes[id].detail),
-			));
+			const isOn = state.outsideRead === true;
+			const unknown = state.outsideRead === null;
+			const trackStyle = Object.assign({}, S.track, {
+				// The accent marks ON; the resting border marks OFF. Both come from theme tokens so the
+				// control reads correctly in light and dark themes.
+				background: unknown
+					? "var(--dsw-border, rgba(128,128,128,0.35))"
+					: (isOn ? "var(--dsw-accent, #3b82f6)" : "var(--dsw-border, rgba(128,128,128,0.35))"),
+			});
+			const knobStyle = Object.assign({}, S.knob, { left: isOn ? "14px" : "2px" });
+			const stateText = unknown ? "…" : (isOn ? t.stateOn : t.stateOff);
+			// Before the first answer — and whenever an answer cannot be obtained — say so plainly.
+			// Concatenating a null error produced the literal text "Read failed: null", which reads as a
+			// bug in the plugin rather than a state the user can act on.
+			const detail = unknown
+				? (state.error === null ? "…" : t.readFailed + state.error)
+				: (isOn ? t.onDetail : t.offDetail);
 
 			return React.createElement("div", { style: S.wrap },
 				React.createElement("button", {
 					type: "button",
 					style: S.button,
-					title: current ? t.tooltip + ": " + current.detail : t.tooltip,
+					title: t.tooltip,
+					// Expands an explanation rather than switching: this control is read-only, and a click
+					// that silently did nothing would read as a bug.
 					onClick: () => setOpen(!open),
-				}, t.label + " ", React.createElement("span", null, label)),
+				},
+					React.createElement("span", { style: S.label }, t.on),
+					React.createElement("span", { style: trackStyle }, React.createElement("span", { style: knobStyle })),
+					React.createElement("span", null, stateText)),
 				open ? React.createElement("div", { style: S.panel },
-					rows,
-					state.error !== null ? React.createElement("span", { style: S.error }, t.readFailed + state.error) : null,
+					React.createElement("span", { style: S.detail }, detail),
 					React.createElement("span", { style: S.note }, t.note),
+					state.error !== null && state.outsideRead !== null
+						? React.createElement("span", { style: S.error }, t.readFailed + state.error)
+						: null,
 				) : null,
 			);
 		}
 
 		/**
-		 * Surface a client-side failure on the page.
-		 *
-		 * The first version of apply() was
-		 *   const slots = ctx.get("slots"); if (slots === undefined) return;
-		 * which is a SILENT no-op: the bundle loads, no error is printed anywhere, and the
-		 * UI simply never appears. That is indistinguishable from "not registered",
-		 * "not applied", and "applied but the slot never resolved", so diagnosing it
-		 * needed a restart per hypothesis. This makes the failure say which one it is.
+		 * Surface a client-side failure on the page. A silent no-op is indistinguishable from "not
+		 * registered", "not applied" and "applied but the slot never resolved", so the failure says which.
 		 */
 		function reportFailure(headline, detail) {
 			try {
@@ -276,24 +257,9 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Client-SERVICE dependencies, by Cordis service name.
-		 *
-		 * These two faces are not interchangeable, which cost a debugging cycle:
-		 *
-		 *   exports.inject (here)                -> SERVICE names; decide what is
-		 *                                           attached to this plugin's ctx
-		 *   package.json dsh.client.inject       -> PACKAGE names; load ordering only
-		 *
-		 * Evidence: dsh-client-resources declares only
-		 * '@deepseek-ai/dsh-client-ui-renderer' in its manifest, yet its bundle says
-		 * inject = ["slots"]. So `slots` reaches a plugin through THIS list, not the
-		 * manifest. An earlier version put a package name here and the manifest, and
-		 * `ctx.get("slots")` still returned undefined on DSH Desktop.
-		 *
-		 * `locale` is declared because the UI must follow the active language. It is still
-		 * read with an undefined check at the use site, and the indicator renders in a
-		 * fallback language without it, so a locale-service problem degrades the TEXT
-		 * rather than removing the control.
+		 * Client-SERVICE dependencies, by Cordis service name. These two faces are not interchangeable:
+		 * `exports.inject` takes SERVICE names and decides what is attached to this plugin's ctx, while
+		 * `package.json` `dsh.client.inject` takes PACKAGE names and only orders loading.
 		 */
 		const inject = ["slots", "locale"];
 
@@ -308,18 +274,16 @@ window.__ModuleLoader__.load({
 				}
 				const locale = ctx.get("locale");
 				if (locale === undefined) {
-					// Not fatal, and deliberately not silent either: the UI still works, but it
-					// falls back to navigator language and will not follow a live switch.
+					// Not fatal, and deliberately not silent: the control still works, but it will not follow
+					// a live language switch.
 					console.warn("[permission-guard] locale service unavailable; language follows navigator only");
 				}
 				console.log("[permission-guard] apply() ran; slots service found. Waiting for " + SLOT + " ...");
 				slots.inject(SLOT, () => {
 					console.log("[permission-guard] slot " + SLOT + " declared; registering...");
 					const dispose = slots.register({ name: SLOT, id: ENTRY_ID, order: 5 }, (slotProps) => {
-						// The slot may already supply props; locale is passed explicitly so the
-						// component never has to reach for a service through a global.
 						const merged = Object.assign({}, slotProps, { locale: locale });
-						return React.createElement(ModeIndicator, merged);
+						return React.createElement(OutsideReadSwitch, merged);
 					});
 					console.log("[permission-guard] registered into " + SLOT);
 					return dispose;
