@@ -32,8 +32,18 @@ const modes = require('./modes.js')
  * `__dirname` rather than a literal path, so the same code works whether the plugin is being developed
  * inside a workspace or installed under the harness home. Under `${DSH_HOME}` a sibling control-plane
  * guard covers it too; the fence below is what stops the MODEL from flipping its own switch.
+ *
+ * `DSH_PERMISSION_GUARD_STATE_FILE` relocates it. That exists for TEST ISOLATION, and the need is
+ * concrete: this directory is the live install, so the suite's writes used to land on the OPERATOR'S
+ * REAL SETTING. The suite writes `false` and `true`, DELETES the file to test the missing case, and
+ * renames it to test the handover — so a Ctrl-C or a crash partway through would leave live permissions
+ * changed, or the file gone, which silently means "outside not readable". A test that can rewrite the
+ * setting it is testing must not run against the real one.
  */
-const STATE_FILE = path.join(__dirname, 'permissions.json')
+const STATE_FILE = (typeof process.env.DSH_PERMISSION_GUARD_STATE_FILE === 'string'
+  && process.env.DSH_PERMISSION_GUARD_STATE_FILE !== '')
+  ? path.resolve(process.env.DSH_PERMISSION_GUARD_STATE_FILE)
+  : path.join(__dirname, 'permissions.json')
 
 /**
  * Every file name this state file has ever had, for the self-escalation fence and the rename handover.
@@ -175,7 +185,23 @@ function currentState() {
   return { outsideRead: modes.DEFAULT_OUTSIDE_READ }
 }
 
+/**
+ * Write the state file.
+ *
+ * THE GUARD IS THE POINT. `JSON.stringify` DROPS an `undefined` value, so a caller that passed a state
+ * object without `outsideRead` produced a file containing only the note — a state file that no longer
+ * states anything. The behaviour stayed safe (an unrecognised file falls back to the restrictive
+ * default) which is exactly why it went unnoticed: the setting silently became "not what the file
+ * said", and nothing anywhere reported it.
+ *
+ * Refusing here turns a silent corruption into a loud one, and the thrown message names the offending
+ * value, so the next occurrence identifies its own caller instead of needing to be deduced.
+ */
 function persistState(state) {
+  if (state === null || typeof state !== 'object' || typeof state.outsideRead !== 'boolean') {
+    throw new TypeError('[permission-guard] refusing to write a state file without a boolean '
+      + STATE_FIELD + '; received ' + JSON.stringify(state))
+  }
   const payload = {
     [STATE_FIELD]: state.outsideRead,
     note: 'Read and written by the permission-guard plugin. This is the only setting it stores:'
@@ -308,9 +334,17 @@ function commandMentionsStateFile(command) {
   return false
 }
 
-/** Whether a path names a state file, in ANY directory and under any of its former names. */
+/**
+ * Whether a path names a state file — the LIVE one by exact path, or any of its former names anywhere.
+ *
+ * The exact-path check is not redundant. The live file can be relocated and therefore not carry a
+ * fenced name, and a fence that only recognised the historical basenames would then let the model write
+ * the very file holding its own switch. The basename checks stay as well, so a rename or a stray copy
+ * under an old name remains fenced.
+ */
 function isStateFile(target) {
   const normalized = normalizePath(target).toLowerCase()
+  if (normalized === normalizePath(STATE_FILE).toLowerCase()) return true
   const base = normalized.split('/').pop()
   if (base === '') return false
   for (let i = 0; i < STATE_FILE_BASENAMES.length; i++) {

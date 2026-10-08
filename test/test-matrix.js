@@ -11,9 +11,9 @@
  */
 
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const ROOT = path.join(__dirname, '..')
-const STATE_FILE = path.join(ROOT, 'permissions.json')
 
 const WORKSPACE = 'D:/project'
 const OUTSIDE = 'D:/elsewhere/secret.txt'
@@ -93,7 +93,26 @@ function mount(options) {
 
 // --------------------------------------------------------- state file helpers
 
-const savedState = fs.existsSync(STATE_FILE) ? fs.readFileSync(STATE_FILE) : null
+/**
+ * THE STATE FILE UNDER TEST MUST NOT BE THE LIVE ONE.
+ *
+ * This package directory IS the live install (the profile links to it), so the suite's writes used to
+ * land on the operator's real setting — and this suite writes `false`, writes `true`, DELETES the file
+ * to test the missing case, and renames it to test the handover. Restoring at exit covered the clean
+ * path, but a Ctrl-C or a crash partway through would leave live permissions changed or the file gone,
+ * which silently means "outside not readable". A test that rewrites the setting it tests has to run
+ * against a throwaway copy.
+ *
+ * Set BEFORE requiring the plugin: the module resolves the path at load.
+ */
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-matrix-'))
+const STATE_FILE = path.join(TMP_DIR, 'permissions.json')
+process.env.DSH_PERMISSION_GUARD_STATE_FILE = STATE_FILE
+
+// Asserted, not merely intended: the whole point of the override is that this suite can never touch the
+// live setting, and a future edit that drops the env var would silently take the operator's file back.
+check('the suite runs against a THROWAWAY state file, not the live one',
+  STATE_FILE !== path.join(ROOT, 'permissions.json') && STATE_FILE.indexOf(TMP_DIR) === 0, STATE_FILE)
 
 function writeState(value) {
   if (typeof value === 'string') fs.writeFileSync(STATE_FILE, value, 'utf8')
@@ -109,10 +128,12 @@ function reported() {
   return registeredTool.execute({}, AGENT).state.outsideRead
 }
 
+// Clean up the throwaway directory and the env override. There is deliberately NO restore step: the
+// live file was never opened, so there is nothing to restore.
 process.on('exit', function () {
   try {
-    if (savedState !== null) fs.writeFileSync(STATE_FILE, savedState)
-    else if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE)
+    delete process.env.DSH_PERMISSION_GUARD_STATE_FILE
+    fs.rmSync(TMP_DIR, { recursive: true, force: true })
   } catch (error) { /* best effort */ }
 })
 
@@ -223,14 +244,15 @@ check('a script API (writeFileSync) naming the state file is DENIED', r.denied, 
 r = run('pwsh', { command: 'node -e "require(\'fs\').renameSync(\'a\', \'' + STATE_POSIX + '\')"' })
 check('a script API (renameSync) naming the state file is DENIED', r.denied, r.reason.slice(0, 60))
 
-// These two run with the session cwd set to the PLUGIN DIRECTORY, so the state file is INSIDE the
-// workspace. Without that the read policy refuses them for being outside — which is correct, and was
-// the reason an earlier version of these assertions failed. They are here to prove the SELF-WRITE
-// fence does not over-block reads, so the read policy must be out of the way.
-r = run('read', { file_path: STATE_POSIX }, ROOT)
+// These two run with the session cwd set to the STATE FILE'S OWN DIRECTORY, so the file is INSIDE the
+// workspace being judged. Without that, the read policy refuses them for being outside — which is
+// correct behaviour, and is exactly what happened when the state file moved to a temp directory and
+// these two still used the plugin directory. Their purpose is to prove the SELF-WRITE fence does not
+// over-block READS, so the read policy has to be out of the way for the assertion to mean anything.
+r = run('read', { file_path: STATE_POSIX }, TMP_DIR)
 check('READING the state file is allowed (knowing the setting is not a capability)', r.allowed, r.reason.slice(0, 60))
 
-r = run('pwsh', { command: 'Get-Content "' + STATE_FILE + '"' }, ROOT)
+r = run('pwsh', { command: 'Get-Content "' + STATE_FILE + '"' }, TMP_DIR)
 check('a READ-ONLY shell command naming the state file is allowed', r.allowed, r.reason.slice(0, 60))
 
 r = run('write', { file_path: WORKSPACE + '/permissions.json', content: 'x' })
@@ -281,13 +303,30 @@ check('a legacy file is REWRITTEN in the new format (not re-interpreted on every
 writeState('{ this is not json')
 check('a malformed state file fails SAFE to outsideRead FALSE', reported() === false)
 
+// A state file that states NOTHING must never be written, and the writer must refuse rather than
+// produce one. `JSON.stringify` DROPS an undefined value, so passing a state object without the field
+// yielded a file containing only the note: intact-looking, and controlling nothing. Behaviour stayed
+// safe because an unrecognised file falls back to the restrictive default — which is exactly why it
+// went unnoticed. This asserts the guard exists so it cannot be removed quietly.
+const persistSource = fs.readFileSync(path.join(ROOT, 'index.js'), 'utf8')
+check('persistState REFUSES to write a state object without a boolean outsideRead',
+  /function persistState\(state\)\s*\{[\s\S]{0,400}?typeof state\.outsideRead !== 'boolean'/.test(persistSource))
+
+// Reading an uninterpretable file must NOT silently rewrite it: a broken state file has to stay
+// visible, or the defect is hidden by the very code that should surface it.
+writeState('{ "note": "no setting here" }')
+const beforeBroken = fs.readFileSync(STATE_FILE, 'utf8')
+check('reading such a file reports the restrictive default', reported() === false)
+check('reading it does NOT silently normalise the file', fs.readFileSync(STATE_FILE, 'utf8') === beforeBroken)
+
 fs.unlinkSync(STATE_FILE)
 check('a MISSING state file fails SAFE to outsideRead FALSE', reported() === false)
 
 console.log('')
 console.log('=== adoption of a renamed state file ===')
 
-const LEGACY_NAME = path.join(ROOT, '权限设置.json')
+// A SIBLING of the state file: the handover only ever looks in the state file's own directory.
+const LEGACY_NAME = path.join(TMP_DIR, '权限设置.json')
 writeState({ outsideRead: true })
 fs.renameSync(STATE_FILE, LEGACY_NAME)
 const adoptedValue = reported()
