@@ -81,7 +81,13 @@ targets another profile; `uninstall` reverses it.
 - **It cannot enable outside reads.** Enabling is refused by a `tools.guard` check, and every write to the state file
   is refused by a self-escalation fence — including through `node -e`, shell scripts, and a hard-link alias under
   another name.
-- **It can disable them**, if it can reach the tool at all. Giving up access is not an escalation.
+- **It CAN reach the `outside_read` tool**, and this is stated as a measured fact rather than hedged. An earlier
+  version of this file claimed the tool never reached the model's tool list; that was true of the build it was
+  measured on and false on the current one, where the tool is callable. It matters because the guard is what stands
+  between the model and its own permission: with the tool reachable, `tools.guard` is load-bearing rather than
+  defending a path nobody can walk. Measured with the tool itself: a call with no arguments returns the report and
+  changes nothing.
+- **It can disable outside reads.** Giving up access is not an escalation, so narrowing is allowed.
 - **It can always read the setting.** Knowing it is not a capability.
 - **It can always write files**, subject to the harness sandbox.
 
