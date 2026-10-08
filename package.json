@@ -58,12 +58,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/huang20080115/dsh-outsideread-switch.git"
+    "url": "git+https://github.com/bluemika111/dsh-outsideread-switch.git"
   },
   "bugs": {
-    "url": "https://github.com/huang20080115/dsh-outsideread-switch/issues"
+    "url": "https://github.com/bluemika111/dsh-outsideread-switch/issues"
   },
-  "homepage": "https://github.com/huang20080115/dsh-outsideread-switch#readme",
+  "homepage": "https://github.com/bluemika111/dsh-outsideread-switch#readme",
   "publishConfig": {
     "access": "public"
   }
