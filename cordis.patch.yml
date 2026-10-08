@@ -1,4 +1,4 @@
-# The permission-guard bundle patch: one insert over whatever the profile already has.
+# The outsideread-switch bundle patch: one insert over whatever the profile already has.
 #
 # HOW THIS GETS APPLIED
 #
@@ -17,5 +17,5 @@
 # `id` is the stable identity. A user who wants to override or disable this row can address
 # it by this id from their own cordis.patch.yml, because their layer is applied last.
 - insert:
-    - id: permission-guard
-      name: dsh-plugin-permission-guard
+    - id: outsideread-switch
+      name: dsh-outsideread-switch

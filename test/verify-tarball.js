@@ -50,7 +50,7 @@ try {
     check('tarball installs', false, String(error.message).split('\n')[0])
   }
 
-  const installed = path.join(scratch, 'node_modules', 'dsh-plugin-permission-guard')
+  const installed = path.join(scratch, 'node_modules', 'dsh-outsideread-switch')
   const installedManifest = path.join(installed, 'package.json')
   const present = fs.existsSync(installedManifest)
   check('the package is installed', present, installed)
@@ -70,7 +70,7 @@ try {
     manifest.dsh && manifest.dsh.client && manifest.dsh.client.platform === 'web',
     JSON.stringify(manifest.dsh && manifest.dsh.client))
 
-  const binShim = path.join(scratch, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh-permission-guard.cmd' : 'dsh-permission-guard')
+  const binShim = path.join(scratch, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh-outsideread-switch.cmd' : 'dsh-outsideread-switch')
   const shimExists = fs.existsSync(binShim)
   check('the CLI shim was created', shimExists, binShim)
   if (shimExists) {
@@ -87,7 +87,7 @@ try {
   const installedSource = fs.readFileSync(path.join(installed, 'index.js'), 'utf8')
 
   check('fail-closed branch present: the tool refuses when tools.guard is missing',
-    /refused: true/.test(installedSource), 'looking for the refusal in permission_mode')
+    /refused: true/.test(installedSource), 'looking for the refusal in outside_read')
 
   // Locate the ACTUAL response payload, not the surrounding prose. An earlier attempt sliced from the
   // route path to the registration log, which swept in the comments explaining what was removed — and a
@@ -115,6 +115,7 @@ try {
     tools: { register: function (t) { tools.push(t) }, get: function () { return {} }, schemas: function () { return [] } },
     systemPrompt: { section: function () {} },
     webServer: { register: function () { return function () {} } },
+    commands: { register: function () { return function () {} } },
     sessions: { list: function () { return [] }, get: function () { return undefined } },
     approval: { setPolicy: function () {}, request: function () { return Promise.resolve('u') } },
     web: { fetch: async function () {}, search: async function () {} },
@@ -136,8 +137,8 @@ try {
     },
   }
   plugin.apply(ctx)
-  const set = tools.find(function (t) { return t.name === 'permission_mode' })
-  check('the installed copy registers permission_mode', set !== undefined)
+  const set = tools.find(function (t) { return t.name === 'outside_read' })
+  check('the installed copy registers outside_read', set !== undefined)
   if (set !== undefined) {
     // `outsideRead: true` is the request that matters: enabling outside reads is the escalation, so it
     // is the one the installed copy must refuse when the monotonic guard is unavailable.

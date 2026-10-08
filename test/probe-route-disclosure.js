@@ -24,6 +24,7 @@ const svc = {
   tools: { register: function () {}, guard: function () { return function () {} }, get: function () { return {} }, schemas: function () { return [] } },
   systemPrompt: { section: function () {} },
   webServer: { register: function (r) { routes.push(r); return function () {} } },
+  commands: { register: function () { return function () {} } },
   sessions: { list: function () { return [] }, get: function () { return undefined } },
   approval: { setPolicy: function () {}, request: function () { return Promise.resolve('unavailable') } },
   web: { fetch: async function () {}, search: async function () {} },

@@ -92,6 +92,10 @@ const bootstrap = {
       }
     }
     if (deps.indexOf('webServer') !== -1) services.webServer = { register: function () { return function () {} } }
+    // Present so the switch registers instead of taking its "commands unavailable" branch, which logs a
+    // loud error. A missing stub there would still pass, but it would print a misleading failure line —
+    // the same trap this file already fixed once for `tools.guard`.
+    if (deps.indexOf('commands') !== -1) services.commands = { register: function () { return function () {} } }
     if (deps.indexOf('sessions') !== -1) {
       services.sessions = {
         list: function () { return [] },

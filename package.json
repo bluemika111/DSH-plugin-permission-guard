@@ -1,5 +1,5 @@
 {
-  "name": "dsh-plugin-permission-guard",
+  "name": "dsh-outsideread-switch",
   "version": "2.0.0",
   "private": false,
   "description": "Tool-layer fence for one dimension the harness sandbox does not have: whether the model may READ outside the session workspace. Writes stay the sandbox's business. Includes a locale-aware composer switch.",
@@ -25,7 +25,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "dsh-permission-guard": "bin/install.js"
+    "dsh-outsideread-switch": "bin/install.js"
   },
   "files": [
     "index.js",
@@ -58,12 +58,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/huang20080115/DSH-plugin-permission-guard.git"
+    "url": "git+https://github.com/huang20080115/dsh-outsideread-switch.git"
   },
   "bugs": {
-    "url": "https://github.com/huang20080115/DSH-plugin-permission-guard/issues"
+    "url": "https://github.com/huang20080115/dsh-outsideread-switch/issues"
   },
-  "homepage": "https://github.com/huang20080115/DSH-plugin-permission-guard#readme",
+  "homepage": "https://github.com/huang20080115/dsh-outsideread-switch#readme",
   "publishConfig": {
     "access": "public"
   }

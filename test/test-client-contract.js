@@ -42,7 +42,7 @@ console.log((idOk ? 'PASS' : 'FAIL') + ' | loader id equals the package name (' 
 // 2. The `dsh.client` declaration and its matching `exports["./client"]` entry.
 //
 // Both halves are REQUIRED and the host enforces the pairing loudly:
-//   "dsh-plugin-permission-guard declares dsh.client but exports no \"./client\" bundle"
+//   "dsh-outsideread-switch declares dsh.client but exports no \"./client\" bundle"
 // which fails the whole `modules` plugin entry and therefore the plugin tree.
 //
 // Career note: this assertion was briefly inverted to FORBID an `exports` map, because
@@ -215,6 +215,28 @@ if (factory === undefined) {
     console.log((bundleInjectOk ? 'PASS' : 'FAIL') + ' | the bundle exports inject declaring the service "' + INJECT_SERVICE + '"'
       + (bundleInjectOk ? '' : ' | got ' + JSON.stringify(bundleInject)))
 
+    // `sessions` must NOT be a declared dependency even though the switch needs it. A declared dependency
+    // is a HARD one, so on a build without the service `apply()` would never run and the whole control
+    // would vanish silently — worse than a control that renders and reports it cannot switch.
+    const hardDependsOnSessions = Array.isArray(bundleInject) && bundleInject.indexOf('sessions') !== -1
+    if (hardDependsOnSessions) failures += 1
+    console.log((hardDependsOnSessions ? 'FAIL' : 'PASS')
+      + ' | "sessions" is NOT a hard dependency (a missing service must not erase the control)')
+
+    // ...and it is obtained softly instead, which is what makes the assertion above safe rather than lossy.
+    //
+    // The check looks for a RESOLVER, not for one literal call. Reading the service once in apply() and
+    // closing over the result is the bug this now guards against: it turned a boot-order race into a
+    // permanent failure, so the switch worked on Desktop and failed in the browser reporting that the
+    // sessions service was not attached. Services have to be resolved when they are needed.
+    const clientSource = fs.readFileSync(bundlePath, 'utf8')
+    const softSessions = clientSource.indexOf('ctx.get(') !== -1
+      && clientSource.indexOf('function getService(') !== -1
+      && clientSource.indexOf('getService: getService') !== -1
+    if (!softSessions) failures += 1
+    console.log((softSessions ? 'PASS' : 'FAIL')
+      + ' | services are resolved through a name-based getter, not captured once at mount')
+
     // And the failure must be VISIBLE, not a silent no-op: with no slots service the
     // plugin has to report rather than return quietly.
     //
@@ -301,16 +323,21 @@ if (factory === undefined) {
       console.log((fallbackLangOk ? 'PASS' : 'FAIL') + ' | an unknown locale falls back to English')
 
       // The detail and the note only render on the open panel, so the checks above cannot see them.
-      // This renders the panel by driving the component's own state through a STATEFUL React stub:
-      // applying the recorded click handler is what a user does, and the setter must actually store the
-      // new value or `open` never flips.
-      function renderPanelText() {
-        const slots = [null, null, null]
+      // This renders the panel by driving the component's own state through a STATEFUL React stub: the
+      // setter must actually store the new value or `open` never flips.
+      //
+      // TWO THINGS CHANGED WHEN THE CONTROL BECAME A SWITCH. The state array is now grown on demand
+      // rather than fixed at three slots — the component has five `useState` calls and a short array
+      // silently handed back `undefined` for the state itself. And the panel is revealed by RIGHT-CLICK:
+      // left-click is the switch, so driving `onClick` here would toggle permissions instead of opening
+      // anything.
+      function renderPanelText(seeded) {
+        const slots = seeded === undefined ? [] : [seeded]
         let cursor = 0
         const panelReact = {
           useState: function (initial) {
             const at = cursor++
-            if (slots[at] === null) slots[at] = initial
+            if (slots.length <= at) slots.push(initial)
             const index = at
             return [slots[index], function (next) {
               slots[index] = typeof next === 'function' ? next(slots[index]) : next
@@ -337,37 +364,121 @@ if (factory === undefined) {
         }).apply(panelCtx)
 
         cursor = 0
-        // The slot entry returns an ELEMENT for ModeIndicator, whose props carry children
-        // alongside locale. Invoke it to reach the rendered tree.
+        // The slot entry returns an ELEMENT whose props carry locale and sessions alongside the slot's
+        // own props. Invoke it to reach the rendered tree.
         const outer = panelComponent({})
         const first = outer.type(outer.props)
-        // Apply the button's onClick so `open` flips to true, then render again.
-        // Apply the button's onClick so `open` flips to true, then render again.
         // children is an array unless there is exactly one child, so index defensively.
         const button = Array.isArray(first.props.children) ? first.props.children[0] : first.props.children
-        button.props.onClick()
+        button.props.onContextMenu({ preventDefault: function () {} })
         cursor = 0
         return textsOf(panelComponent({}), []).join(' | ')
       }
 
+      /**
+       * Drive an actual switch flip and return the command lines it issued.
+       *
+       * THE STATE IS SEEDED rather than fetched: the component's first `useState` is its read state, so
+       * pre-loading that slot with a known value is what lets a synchronous test reach the switch path at
+       * all. Without it the component is still "unknown", and a click correctly refuses to toggle.
+       *
+       * @param options.sessionsInitially - false makes `sessions` absent for the first render.
+       * @param options.arriveBeforeClick - after that first render, make it appear and render again. This
+       *        is the regression case for the reported bug: capturing the service at mount time made the
+       *        boot-order race permanent, so the switch worked on Desktop and dead-ended in the browser.
+       */
+      function clickSwitch(seeded, options) {
+        const opts = options || {};
+        let sessionsExist = opts.sessionsInitially !== false;
+        const slots = [seeded]
+        let cursor = 0
+        const react = {
+          useState: function (initial) {
+            const at = cursor++
+            if (slots.length <= at) slots.push(initial)
+            const index = at
+            return [slots[index], function (next) {
+              slots[index] = typeof next === 'function' ? next(slots[index]) : next
+            }]
+          },
+          useEffect: function () {},
+          createElement: fakeReact.createElement,
+        }
+        let comp = null
+        const issued = []
+        const sessions = {
+          binding: function (id) {
+            return {
+              session: {
+                command: function (line) {
+                  issued.push({ sessionId: id, line: line })
+                  return Promise.resolve({ ok: true, value: { matched: true } })
+                },
+              },
+            }
+          },
+        }
+        const ctx = {
+          get: function (name) {
+            if (name === 'locale') return fakeLocaleService
+            if (name === 'sessions') return sessionsExist ? sessions : undefined
+            if (name !== 'slots') return undefined
+            return {
+              inject: function (key, cb) { cb() },
+              register: function (options, c) { if (typeof c === 'function') comp = c; return function () {} },
+            }
+          },
+        }
+        const factory = registered.get(pkg.name)
+        factory(function (name) {
+          if (name === 'react') return react
+          throw new Error('unexpected require: ' + name)
+        }).apply(ctx)
+
+        cursor = 0
+        let outer = comp({ sessionId: 'session-under-test' })
+        let first = outer.type(outer.props)
+        let button = Array.isArray(first.props.children) ? first.props.children[0] : first.props.children
+
+        if (opts.arriveBeforeClick === true) {
+          // The service appears, and the page renders again — which is all a real user would experience.
+          // Re-rendering is what gives the component a chance to see it; the click below uses the handler
+          // from this SECOND render, exactly as React would hand it over.
+          sessionsExist = true
+          cursor = 0
+          outer = comp({ sessionId: 'session-under-test' })
+          first = outer.type(outer.props)
+          button = Array.isArray(first.props.children) ? first.props.children[0] : first.props.children
+        }
+
+        button.props.onClick()
+        return issued
+      }
+
       activeLocale = 'zh-CN'
       const zhPanel = renderPanelText()
-      // The control reports ONE boolean now, so the panel carries the note rather than a list of four
-      // modes. Asserting the note keeps the panel from silently losing its only actionable text.
-      const zhNote = zhPanel.indexOf('只读显示') !== -1
+      // The control reports ONE boolean, so the panel carries the note rather than a list of four modes.
+      // Asserting the note keeps the panel from silently losing its only explanatory text.
+      const zhNote = zhPanel.indexOf('点击切换') !== -1
       if (!zhNote) failures += 1
       console.log((zhNote ? 'PASS' : 'FAIL') + ' | the open panel carries the Chinese note (' + zhPanel.slice(0, 48) + '...)')
 
-      // THE UI MUST NOT NAME A MECHANISM THAT DOES NOT EXIST, OR ONE THAT NO LONGER APPLIES.
+      // THE UI MUST NOT CALL ITSELF READ-ONLY ANY MORE, AND MUST NOT NAME A MECHANISM THAT IS ABSENT.
       //
-      // Two separate mistakes are guarded here. The note once said "use the permission_mode tool", but
-      // the tool never reaches the model's tool list, so a reader following that advice finds nothing.
-      // The note then said "use the built-in permission selector" — true when this plugin mirrored the
-      // harness sandbox, and FALSE after the redesign: the selector controls the kernel's WRITE mode and
-      // has no effect on outside reads at all.
-      const mentionsTool = zhPanel.indexOf('permission_mode') !== -1
+      // Three separate mistakes are guarded here. The note once said "use the permission_mode tool", but
+      // the tool never reaches the model's tool list, so a reader following that advice finds nothing;
+      // that tool is now called outside_read, and the check below follows the rename. It then said "use
+      // the built-in permission selector" — true when this plugin mirrored the harness sandbox, and FALSE
+      // after the redesign, because the selector controls the kernel's WRITE mode. Finally it said
+      // "read-only display", which was honest while the switch was inert and became a lie the moment the
+      // control could actually switch.
+      const claimsReadOnly = zhPanel.indexOf('只读') !== -1
+      if (claimsReadOnly) failures += 1
+      console.log((claimsReadOnly ? 'FAIL' : 'PASS') + ' | the panel does NOT call itself a read-only display any more')
+
+      const mentionsTool = zhPanel.indexOf('outside_read') !== -1
       if (mentionsTool) failures += 1
-      console.log((mentionsTool ? 'FAIL' : 'PASS') + ' | the panel note does not point at the permission_mode tool')
+      console.log((mentionsTool ? 'FAIL' : 'PASS') + ' | the panel note does not point at the outside_read tool')
 
       const namesSelector = zhPanel.indexOf('选择器') !== -1
       if (namesSelector) failures += 1
@@ -379,9 +490,15 @@ if (factory === undefined) {
 
       activeLocale = 'en'
       const enPanel = renderPanelText()
-      const enNote = enPanel.indexOf('Read-only display') !== -1
+      const enNote = enPanel.indexOf('Click to switch') !== -1
       if (!enNote) failures += 1
       console.log((enNote ? 'PASS' : 'FAIL') + ' | the open panel carries the English note (' + enPanel.slice(0, 48) + '...)')
+
+      // Symmetric to the Chinese check above. Both languages must stop calling this a read-only display:
+      // one stale translation is enough to tell an English reader the control does nothing.
+      const enClaimsReadOnly = enPanel.indexOf('Read-only') !== -1
+      if (enClaimsReadOnly) failures += 1
+      console.log((enClaimsReadOnly ? 'FAIL' : 'PASS') + ' | the English panel does NOT call itself read-only either')
       activeLocale = 'en'
 
       // With no locale service the UI must still render — degrading the TEXT, not the control.
@@ -390,6 +507,61 @@ if (factory === undefined) {
       const fallbackOk = fallbackText.length > 0
       if (!fallbackOk) failures += 1
       console.log((fallbackOk ? 'PASS' : 'FAIL') + ' | with no locale service the indicator still renders (' + fallbackText.slice(0, 40) + '...)')
+
+      // ---------------------------------------------------------------- the switch itself
+      //
+      // THE ONLY ASSERTION THAT MATTERS FOR THIS CONTROL. Everything above proves it renders; none of it
+      // proves it switches. A decorative toggle that renders perfectly is exactly the failure this plugin
+      // already shipped once, so the click is driven and its command inspected.
+      activeLocale = 'en'
+
+      const fromOff = clickSwitch({ ready: true, outsideRead: false, error: null })
+      const turnOn = fromOff.length === 1 && fromOff[0].line === '/outside-read on'
+      if (!turnOn) failures += 1
+      console.log((turnOn ? 'PASS' : 'FAIL') + ' | clicking an OFF switch issues the enabling command'
+        + (turnOn ? '' : ' | got ' + JSON.stringify(fromOff)))
+
+      const fromOn = clickSwitch({ ready: true, outsideRead: true, error: null })
+      const turnOff = fromOn.length === 1 && fromOn[0].line === '/outside-read off'
+      if (!turnOff) failures += 1
+      console.log((turnOff ? 'PASS' : 'FAIL') + ' | clicking an ON switch issues the disabling command'
+        + (turnOff ? '' : ' | got ' + JSON.stringify(fromOn)))
+
+      const addressed = fromOff.length === 1 && fromOff[0].sessionId === 'session-under-test'
+      if (!addressed) failures += 1
+      console.log((addressed ? 'PASS' : 'FAIL')
+        + ' | the command is addressed to the SESSION FROM THE SLOT PROPS, not a guessed id')
+
+      // An unknown state must NOT guess a direction: toggling from "unknown" would have to invent a
+      // current value, and inventing one is how a switch ends up widening access by accident.
+      const unknownState = clickSwitch({ ready: true, outsideRead: null, error: null })
+      const refusedUnknown = unknownState.length === 0
+      if (!refusedUnknown) failures += 1
+      console.log((refusedUnknown ? 'PASS' : 'FAIL') + ' | a click while the state is UNKNOWN issues no command'
+        + (refusedUnknown ? '' : ' | got ' + JSON.stringify(unknownState)))
+
+      // THE REGRESSION TEST FOR THE REPORTED BUG, and the reason services are resolved lazily.
+      //
+      // The switch worked on Desktop and failed in the browser with "the sessions client service is not
+      // attached". The cause was reading the service ONCE in apply() and closing over the result: a
+      // boot-order race became permanent, because a captured undefined never becomes anything else. This
+      // makes the service appear AFTER the first render and expects the next click to work. Against the
+      // old code it issues nothing at all, however long the page stays open.
+      const lateService = clickSwitch({ ready: true, outsideRead: false, error: null },
+        { sessionsInitially: false, arriveBeforeClick: true })
+      const recovered = lateService.length === 1 && lateService[0].line === '/outside-read on'
+      if (!recovered) failures += 1
+      console.log((recovered ? 'PASS' : 'FAIL')
+        + ' | a service registering AFTER mount is picked up (the Desktop-vs-browser race)'
+        + (recovered ? '' : ' | got ' + JSON.stringify(lateService)))
+
+      // And when the service is genuinely absent the control must refuse rather than pretend — which is
+      // what the browser reported before this fix, and is still the correct answer.
+      const stillAbsent = clickSwitch({ ready: true, outsideRead: false, error: null }, { sessionsInitially: false })
+      const refusedAbsent = stillAbsent.length === 0
+      if (!refusedAbsent) failures += 1
+      console.log((refusedAbsent ? 'PASS' : 'FAIL') + ' | with the service genuinely absent, no command is issued'
+        + (refusedAbsent ? '' : ' | got ' + JSON.stringify(stillAbsent)))
     }
   }
 }

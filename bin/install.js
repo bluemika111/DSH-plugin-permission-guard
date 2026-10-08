@@ -2,7 +2,7 @@
 'use strict'
 
 /**
- * Installer for dsh-plugin-permission-guard.
+ * Installer for dsh-outsideread-switch.
  *
  * WHY THIS EXISTS INSTEAD OF `dsh plugin add`
  *
@@ -41,8 +41,8 @@
  * snapshots before exiting non-zero.
  *
  * Usage:
- *   npx dsh-plugin-permission-guard install [--profile <name>] [--dry-run]
- *   npx dsh-plugin-permission-guard uninstall
+ *   npx dsh-outsideread-switch install [--profile <name>] [--dry-run]
+ *   npx dsh-outsideread-switch uninstall
  */
 
 const fs = require('node:fs')
@@ -113,7 +113,7 @@ function parseArgs(argv) {
 
 function help() {
   info([
-    'dsh-plugin-permission-guard',
+    'dsh-outsideread-switch',
     '',
     'Usage:',
     '  npx ' + PACKAGE_NAME + ' install   [--profile <name>] [--dry-run]',
@@ -173,7 +173,7 @@ function makeRollback() {
 }
 
 function writeAtomic(file, text) {
-  const temporary = file + '.dsh-permission-guard.tmp'
+  const temporary = file + '.dsh-outsideread-switch.tmp'
   fs.writeFileSync(temporary, text)
   fs.renameSync(temporary, file)
 }
@@ -383,7 +383,7 @@ function install(options) {
   info('startup, so the plugin will not appear until then.')
   info('')
   info('After restarting you should see an outside-read switch in the composer, and the')
-  info('permission_mode tool becomes available. The initial setting is outsideRead: false —')
+  info('outside_read tool becomes available. The initial setting is outsideRead: false —')
   info('the model may NOT read outside the session workspace. Writes are not affected; the')
   info('harness sandbox confines those. To allow outside reads, edit outsideRead in')
   info('permissions.json next to the installed plugin. The composer switch DISPLAYS the')

@@ -31,6 +31,7 @@ let registeredTool = null
 let registeredGuard = null
 let registeredRoute = null
 let promptSection = null
+let registeredCommand = null
 
 function makeCtx(options) {
   const opts = options || {}
@@ -41,6 +42,9 @@ function makeCtx(options) {
       guard: opts.noGuard === true ? undefined : function (fn) { registeredGuard = fn; return function () {} },
     },
     webServer: { register: function (route) { registeredRoute = route; return function () {} } },
+    commands: opts.noCommands === true
+      ? undefined
+      : { register: function (def) { registeredCommand = def; return function () {} } },
   }
   function get(name) { return svc[name] }
   const ctx = {
@@ -85,6 +89,7 @@ function mount(options) {
   registeredGuard = null
   registeredRoute = null
   promptSection = null
+  registeredCommand = null
   delete require.cache[require.resolve(path.join(ROOT, 'index.js'))]
   const fresh = require(path.join(ROOT, 'index.js'))
   fresh.apply(makeCtx(options))
@@ -145,10 +150,10 @@ writeState({ outsideRead: false })
 mount()
 
 check('a tools/pre-execute listener is registered', listener !== null)
-check('the permission_mode tool is registered', registeredTool !== null && registeredTool.name === 'permission_mode')
+check('the outside_read tool is registered', registeredTool !== null && registeredTool.name === 'outside_read')
 check('the monotonic guard is registered', registeredGuard !== null)
 check('a state route is registered at the new path', registeredRoute !== null
-  && registeredRoute.path === '/permission-guard/state', registeredRoute ? registeredRoute.path : '(none)')
+  && registeredRoute.path === '/outsideread-switch/state', registeredRoute ? registeredRoute.path : '(none)')
 check('a system-prompt boundary section is registered', promptSection !== null)
 if (listener === null) { console.log('FATAL: nothing further can be checked'); process.exit(1) }
 
@@ -361,17 +366,17 @@ console.log('')
 console.log('=== the guard refuses WIDENING ===')
 
 writeState({ outsideRead: false })
-const guardVerdict = registeredGuard({ name: 'permission_mode', arguments: { outsideRead: true } })
+const guardVerdict = registeredGuard({ name: 'outside_read', arguments: { outsideRead: true } })
 check('the guard refuses enabling outside reads', typeof guardVerdict === 'string' && guardVerdict.length > 0)
 check('the refusal explains the self-escalation shape', /self-escalation|raise its own|CVE/i.test(String(guardVerdict)))
 
-const guardNarrow = registeredGuard({ name: 'permission_mode', arguments: { outsideRead: false } })
+const guardNarrow = registeredGuard({ name: 'outside_read', arguments: { outsideRead: false } })
 check('the guard ALLOWS narrowing (returns undefined)', guardNarrow === undefined)
 
 const guardOther = registeredGuard({ name: 'read', arguments: { file_path: OUTSIDE } })
-check('the guard ignores tools other than permission_mode', guardOther === undefined)
+check('the guard ignores tools other than outside_read', guardOther === undefined)
 
-const guardNoop = registeredGuard({ name: 'permission_mode', arguments: {} })
+const guardNoop = registeredGuard({ name: 'outside_read', arguments: {} })
 check('the guard ignores an argument-less report call', guardNoop === undefined)
 
 console.log('')
@@ -462,6 +467,58 @@ mount()
 const forced = registeredTool.execute({}, AGENT).fallbackWorkspace
 check('the env override wins over the home directory', forced === 'D:/forced', forced)
 delete process.env.DSH_PERMISSION_GUARD_WORKSPACE
+
+console.log('')
+console.log('=== the switch command: the only write path the model cannot take ===')
+
+writeState({ outsideRead: false })
+mount()
+
+check('the switch command is registered', registeredCommand !== null
+  && registeredCommand.name === 'outside-read', registeredCommand ? registeredCommand.name : '(none)')
+check('the command declares its input hint so the composer can prompt', registeredCommand !== null
+  && registeredCommand.input !== undefined && typeof registeredCommand.input.hint === 'string')
+
+function runCommand(raw) {
+  return registeredCommand.handler({ commandId: 'c1', agent: { id: 's1' }, rawInput: raw, attachments: [], signal: undefined })
+}
+
+let cmd = runCommand('on')
+check('the command can ENABLE outside reads (the human path, unlike the tool)',
+  cmd.kind === 'success' && outsideReadNow() === true, JSON.stringify(cmd))
+check('the success text states the new value', /true/.test(String(cmd.text)))
+
+cmd = runCommand('off')
+check('the command can DISABLE outside reads', cmd.kind === 'success' && outsideReadNow() === false, JSON.stringify(cmd))
+
+cmd = runCommand('')
+check('an empty argument REPORTS and changes nothing', cmd.kind === 'success'
+  && /false/.test(String(cmd.text)) && outsideReadNow() === false, JSON.stringify(cmd))
+
+cmd = runCommand('status')
+check('"status" reports without changing', cmd.kind === 'success' && outsideReadNow() === false)
+
+cmd = runCommand('sideways')
+check('an unknown argument is an ERROR with usage, not a silent success',
+  cmd.kind === 'error' && /on \| off/.test(String(cmd.text)), JSON.stringify(cmd))
+check('an unknown argument changes nothing', outsideReadNow() === false)
+
+writeState({ outsideRead: true })
+cmd = runCommand('on')
+check('setting the value it already has reports success without a needless write',
+  cmd.kind === 'success' && /already/.test(String(cmd.text)), JSON.stringify(cmd))
+
+// A missing registry must NOT take down the fence. The switch is a convenience; the read policy is the
+// product, and they must fail independently.
+writeState({ outsideRead: true })
+mount({ noCommands: true })
+check('with NO commands service the plugin still mounts', listener !== null && registeredTool !== null)
+check('the command is not registered when the service is absent', registeredCommand === null)
+r = run('read', { file_path: OUTSIDE })
+check('with no commands service the read fence still works', r.allowed)
+writeState({ outsideRead: false })
+r = run('read', { file_path: OUTSIDE })
+check('and it still denies when outside reads are off', r.denied)
 
 console.log('')
 console.log('=== no stale four-mode vocabulary reaches a user ===')

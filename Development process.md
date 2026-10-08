@@ -1,4 +1,17 @@
-# Development process — dsh-plugin-permission-guard
+# Development process — dsh-outsideread-switch
+
+> **这个文档是开发记录，按当时的样子保留。** 插件曾用名 `dsh-plugin-permission-guard`，在 2.0 之
+> 后更名为 `dsh-outsideread-switch`（`dsh-plugin-permission-guard` 作为 npm 包名已废弃）。**下面提到
+> 旧名的地方多数是历史事实的记载**——当时的四档设计、当时的目录、当时的 diff——改写它们等于伪造记录。
+> 需要判断"现在叫什么"时，以 `package.json` 的 `name` 为准。
+>
+> 变更点：包名与 bundle 名、`plugin.name`、客户端 bundle id、日志前缀、状态接口路径
+> （`/permission-guard/state` → `/outsideread-switch/state`）均已更名。**状态文件名 `permissions.json`
+> 保持不变**，因为它同时是 self-escalation 围栏的匹配依据，改名会牵动保护逻辑而收益为零。
+>
+> 另外，注册给模型的工具也从 `permission_mode` 更名为 **`outside_read`**——旧名是四档时代的遗留，而它
+> 现在管的是"外部可读"。**下面凡是提到 `permission_mode` 的地方都是那次改名之前的事实记载**，读作
+> `outside_read` 即可。
 
 实现 `<workspace>\<spec-file>` 里那四个权限档位，作为**工具层**的文件读写围栏。
 

@@ -1,6 +1,6 @@
-# dsh-plugin-permission-guard
+# dsh-outsideread-switch
 
-A [DeepSeek Harness](https://www.npmjs.com/package/dsh-plugin-permission-guard) plugin that decides **one** thing:
+A [DeepSeek Harness](https://www.npmjs.com/package/dsh-outsideread-switch) plugin that decides **one** thing:
 
 > **May the model read outside the session workspace?**
 
@@ -12,7 +12,7 @@ this plugin exists to supply it.
 // permissions.json, beside the installed plugin
 {
   "outsideRead": false,
-  "note": "Read and written by the permission-guard plugin. ..."
+  "note": "Read and written by the outsideread-switch plugin. ..."
 }
 ```
 
@@ -36,29 +36,41 @@ them. Writes are yours, through the harness's own control.
 
 ## Changing the setting
 
-Edit `outsideRead` in `permissions.json`, beside the installed plugin. It is re-read on every check, so the change
-applies immediately — no restart.
+Two ways, both immediate — the state file is re-read on every check, so there is nothing to restart.
 
-The composer control this plugin adds is a **read-only switch**: it shows the current setting and explains it when
-clicked. It does not flip, and that is deliberate rather than unfinished. A working switch needs a channel the
-**model** cannot reach, because a model that can flip it grants itself outside reads. The obvious candidate — an
-HTTP write route — is the one thing that must not exist: HTTP never passes through the tool seam, so the model's own
-shell could call it, routing around the fence that protects the state file. Plausible channels (a host method over
-the package-private client→host RPC, or the harness config editor) have not yet been verified for a profile plugin,
-so the control reads the setting and names the route that works rather than pretending.
+- **The switch in the composer.** Click it to toggle. It shows the current setting, and this is the intended way.
+- **Edit `outsideRead` in `permissions.json`**, beside the installed plugin. Kept as the fallback for when the UI
+  cannot help — a broken page, or a build where the client half did not load.
+
+### How the switch writes
+
+It runs a host command, `/outside-read on|off`, issued from the client through the session's own
+`command(line)`. That choice is the security design, not an implementation detail:
+
+- **An HTTP write route is the one thing that must not exist.** HTTP never passes through `tools/pre-execute`, so
+  the model's own shell could POST to it and route around the fence that protects the state file. The switch would
+  have handed over exactly the capability it exists to withhold.
+- **A command is the harness's human-command registry.** The model cannot type a slash command, and this plugin
+  invents no route of its own.
+- You can also run `/outside-read on|off|status` yourself.
+
+**The residual assumption, stated rather than buried:** the connection RPC that carries the command is the same
+channel the harness's own permission selector uses, so anything able to drive it could already change the built-in
+sandbox preset. The switch therefore adds no new class of exposure — but it is not a stronger barrier either. The
+only way to make the barrier strictly stronger is to have no switch.
 
 ## Requirements
 
 - DeepSeek Harness with the `tools` service (the tool layer this fences).
 - **`tools.guard` is required for the switch to be safe.** `guard()` is the monotonic seam that makes a tool call
-  unable to widen the model's own access. When it is absent, the `permission_mode` tool becomes **report-only**:
+  unable to widen the model's own access. When it is absent, the `outside_read` tool becomes **report-only**:
   changes are refused outright, because allowing them would let the model enable its own outside reads. The read
   fence itself is unaffected — it does not depend on the guard.
 
 ## Install
 
 ```sh
-npx --yes dsh-plugin-permission-guard@latest install
+npx --yes dsh-outsideread-switch@latest install
 ```
 
 Then **restart DSH**: the composition is evaluated only at startup. `--dry-run` prints the plan; `--profile <name>`
@@ -122,7 +134,7 @@ corresponding built-in preset instead.
 ## Uninstall
 
 ```sh
-npx --yes dsh-plugin-permission-guard uninstall
+npx --yes dsh-outsideread-switch uninstall
 ```
 
 Removing the plugin directory removes the setting with it. To keep it, copy `permissions.json` out first and put it

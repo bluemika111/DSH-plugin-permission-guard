@@ -1,7 +1,7 @@
 'use strict'
 
 /**
- * dsh-plugin-permission-guard — a tool-layer fence for the ONE dimension the harness kernel does not
+ * dsh-outsideread-switch — a tool-layer fence for the ONE dimension the harness kernel does not
  * have: whether the model may read outside the session workspace.
  *
  * WHAT THIS PLUGIN DOES NOT DO, AND WHY THAT IS THE POINT
@@ -64,6 +64,15 @@ let guardArmed = false
 
 /** How many times the tool narrowed the setting. Widening is refused, so this is the only direction. */
 let narrowingsByTool = 0
+
+/**
+ * How many times the composer switch changed the setting.
+ *
+ * Counted separately from the tool's narrowings because the two have different authority: the tool may
+ * only narrow, while the command is the human path and may widen. Adding them would hide which caller
+ * moved the setting, which is the first question anyone asks after a surprise.
+ */
+let commandFlips = 0
 
 // ---------------------------------------------------------------- path helpers
 
@@ -155,9 +164,9 @@ function adoptRenamedStateFile() {
       try {
         fs.unlinkSync(candidate)
       } catch (error) {
-        console.error('[permission-guard] adopted the former state file but could not remove it:', candidate, String(error))
+        console.error('[outsideread-switch] adopted the former state file but could not remove it:', candidate, String(error))
       }
-      console.log('[permission-guard] adopted state file', candidate, '->', STATE_FILE)
+      console.log('[outsideread-switch] adopted state file', candidate, '->', STATE_FILE)
       return adopted
     } catch (error) { /* absent or malformed: try the next former name */ }
   }
@@ -174,7 +183,7 @@ function currentState() {
     const parsed = interpret(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')))
     if (parsed !== undefined) {
       if (parsed.legacyMode !== undefined) {
-        console.log('[permission-guard] migrated legacy mode', parsed.legacyMode, '-> outsideRead', parsed.outsideRead)
+        console.log('[outsideread-switch] migrated legacy mode', parsed.legacyMode, '-> outsideRead', parsed.outsideRead)
         try { persistState(parsed) } catch (error) { /* re-migrated next call */ }
       }
       return { outsideRead: parsed.outsideRead }
@@ -199,12 +208,12 @@ function currentState() {
  */
 function persistState(state) {
   if (state === null || typeof state !== 'object' || typeof state.outsideRead !== 'boolean') {
-    throw new TypeError('[permission-guard] refusing to write a state file without a boolean '
+    throw new TypeError('[outsideread-switch] refusing to write a state file without a boolean '
       + STATE_FIELD + '; received ' + JSON.stringify(state))
   }
   const payload = {
     [STATE_FIELD]: state.outsideRead,
-    note: 'Read and written by the permission-guard plugin. This is the only setting it stores:'
+    note: 'Read and written by the outsideread-switch plugin. This is the only setting it stores:'
       + ' whether the model may READ outside the workspace. Writes are confined by the harness sandbox.',
   }
   fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2) + '\n', 'utf8')
@@ -220,7 +229,7 @@ function stateName(state) {
 function record(entry) {
   audit.push(entry)
   if (audit.length > 200) audit.splice(0, audit.length - 200)
-  console.log('[permission-guard] DENY', entry.tool, entry.reason)
+  console.log('[outsideread-switch] DENY', entry.tool, entry.reason)
 }
 
 function allow() {
@@ -402,7 +411,7 @@ function fenceSelfWrite(exec, args) {
       outsideRead: currentState().outsideRead,
     })
     if (audit.length > 200) audit.splice(0, audit.length - 200)
-    console.log('[permission-guard] DENY self-flip', name, resolved)
+    console.log('[outsideread-switch] DENY self-flip', name, resolved)
     return {
       kind: 'deny',
       reason: 'The DSH permission guard denied this call (self-escalation guard): the target is the'
@@ -473,7 +482,7 @@ function inspect(exec) {
     if (modes.SHELL_TOOLS.has(name)) return fenceShell(exec, args, state)
     return null
   } catch (error) {
-    console.error('[permission-guard] inspection failed, allowing call:', String(error))
+    console.error('[outsideread-switch] inspection failed, allowing call:', String(error))
     return null
   }
 }
@@ -507,7 +516,7 @@ function boundaryText(state, context) {
     ? '(not resolvable this turn; the fence uses the session\'s own cwd)'
     : workspace
   const outside = state.outsideRead ? 'READABLE' : 'NOT readable'
-  return '[permission-guard] Session workspace = ' + workspaceText + '.'
+  return '[outsideread-switch] Session workspace = ' + workspaceText + '.'
     + ' Reading outside the workspace is ' + outside + '.'
     + ' This plugin decides ONLY that; writes are confined by the harness sandbox, not by this plugin.'
     + ' The model cannot change the setting; ask the human to switch it.'
@@ -517,7 +526,7 @@ function statusReport(context) {
   const state = currentState()
   const workspace = sessionWorkspace(context)
   return {
-    plugin: 'permission-guard',
+    plugin: 'outsideread-switch',
     scope: 'outside-read policy only; writes are the harness sandbox\'s business',
     enforcement: 'tool layer (not a kernel boundary)',
     stateFile: STATE_FILE,
@@ -545,11 +554,13 @@ function statusReport(context) {
       selfFlipBlocks: stats.selfFlipBlocks,
     },
     narrowingsByTool: narrowingsByTool,
+    commandFlips: commandFlips,
     limits: [
       'shell commands are judged by path heuristic only; deliberately obfuscated pwsh can evade the read restriction',
       'any shell command naming an outside path is refused while outside reads are off, including one that only writes there',
       'writes are NOT fenced by this plugin: the harness sandbox owns them, so a permissive built-in preset allows outside writes',
       'the setting is process-global, not per-session',
+      'the composer switch writes through a host command, so it is protected by the same barrier as the client connection RPC — not by a stronger one',
     ],
     recentDenials: audit.slice(-5),
   }
@@ -565,13 +576,13 @@ function requestedState(args) {
 }
 
 const plugin = {
-  name: 'permission-guard',
+  name: 'outsideread-switch',
   apply(ctx) {
     // Seed the state file on first load so the current setting is visible on disk.
     try {
       if (!fs.existsSync(STATE_FILE)) persistState(currentState())
     } catch (error) {
-      console.error('[permission-guard] could not seed the state file:', String(error))
+      console.error('[outsideread-switch] could not seed the state file:', String(error))
     }
 
     ctx.on('tools/pre-execute', function (exec, next) {
@@ -585,7 +596,7 @@ const plugin = {
     // WHICH workspace this turn is judged against.
     ctx.inject(['systemPrompt'], function (promptCtx) {
       promptCtx.systemPrompt.section({
-        name: 'permission-guard:boundaries',
+        name: 'outsideread-switch:boundaries',
         order: 0,
         text: function (context) {
           return boundaryText(currentState(), context)
@@ -600,7 +611,7 @@ const plugin = {
         guardArmed = true
         toolsCtx.tools.guard(function (execution) {
           try {
-            if (String(execution && execution.name) !== 'permission_mode') return undefined
+            if (String(execution && execution.name) !== 'outside_read') return undefined
             const next = requestedState(execution && execution.arguments)
             if (next === undefined) return undefined
             const current = currentState()
@@ -609,30 +620,30 @@ const plugin = {
             stats.selfFlipBlocks += 1
             audit.push({
               at: new Date().toISOString(),
-              tool: 'permission_mode',
+              tool: 'outside_read',
               reason: 'self-escalation guard: the model attempted to enable outside reads',
               from: current.outsideRead,
               to: next.outsideRead,
             })
             if (audit.length > 200) audit.splice(0, audit.length - 200)
-            console.log('[permission-guard] DENY self-flip via tool', current.outsideRead, '->', next.outsideRead)
+            console.log('[outsideread-switch] DENY self-flip via tool', current.outsideRead, '->', next.outsideRead)
             return 'The DSH permission guard refused this change: enabling outside reads extends the model\'s'
               + ' own file access, and the model cannot raise its own permissions — that is the'
               + ' CVE-2026-82533 shape. Ask the human to switch it, or to edit ' + STATE_FILE + '.'
           } catch (error) {
             // FAIL CLOSED, unlike the file fence: the recoverable outcome is a refused change.
-            console.error('[permission-guard] state-switch guard failed, refusing the change:', String(error))
+            console.error('[outsideread-switch] state-switch guard failed, refusing the change:', String(error))
             return 'The DSH permission guard could not evaluate this change, so it refused it (fail-closed).'
           }
         })
       } else {
-        console.error('[permission-guard] tools.guard is unavailable on this DSH build, so the'
-          + ' permission_mode tool is REPORT-ONLY: changes are refused, because allowing them would let the'
+        console.error('[outsideread-switch] tools.guard is unavailable on this DSH build, so the'
+          + ' outside_read tool is REPORT-ONLY: changes are refused, because allowing them would let the'
           + ' model raise its own permissions. The read fence itself is unaffected.')
       }
 
       toolsCtx.tools.register({
-        name: 'permission_mode',
+        name: 'outside_read',
         description: 'Report or change whether the model may READ outside the session workspace. Writes are'
           + ' not covered by this plugin; the harness sandbox confines them. Reports when called without'
           + ' arguments; enabling outside reads is refused',
@@ -699,7 +710,7 @@ const plugin = {
     ctx.inject(['webServer'], function (webCtx) {
       webCtx.webServer.register({
         kind: 'exact',
-        path: '/permission-guard/state',
+        path: '/outsideread-switch/state',
         handler: function (req, res) {
           if (req.method !== 'GET' && req.method !== 'HEAD') {
             res.statusCode = 405
@@ -714,10 +725,81 @@ const plugin = {
           res.end(JSON.stringify({ outsideRead: state.outsideRead, name: stateName(state) }))
         },
       })
-      console.log('[permission-guard] state route registered at /permission-guard/state')
+      console.log('[outsideread-switch] state route registered at /outsideread-switch/state')
     })
 
-    console.log('[permission-guard] active; state file =', STATE_FILE, '; outsideRead =', currentState().outsideRead)
+    // THE HUMAN SWITCH: a command, run by the control in the composer.
+    //
+    // WHY A COMMAND AND NOT A WRITE ROUTE. The switch has to change the same setting the fence reads,
+    // and the model must not be able to flip it. An HTTP write route fails that test BY CONSTRUCTION:
+    // HTTP never passes `tools/pre-execute`, so the model's own shell could POST to it and route around
+    // the fence that protects the state file. A command has no such property — commands are the
+    // harness's HUMAN-command registry, the model cannot type a slash command, and the client reaches
+    // this one over the app's own connection RPC instead of a route this plugin invents.
+    //
+    // THE RESIDUAL ASSUMPTION, STATED RATHER THAN BURIED: that RPC channel is the same one the
+    // harness's OWN permission selector uses (`permissionPresets.catalog` is `@Remote`), so anything
+    // able to drive it could already change the built-in sandbox preset. This switch therefore adds no
+    // new class of exposure — but the setting ends up protected by the same KIND of barrier as the rest
+    // of the plugin, not by a stronger one. The alternative, refusing to build a switch at all, is the
+    // only way to make the barrier strictly stronger.
+    //
+    // The command deliberately does NOT consult the monotonic tool guard: that guard exists to stop the
+    // MODEL widening its own access, and a human command is the sanctioned way to widen it. The tool
+    // path keeps its guard unchanged.
+    ctx.inject(['commands'], function (cmdCtx) {
+      if (cmdCtx === undefined || cmdCtx === null || cmdCtx.commands === undefined
+        || typeof cmdCtx.commands.register !== 'function') {
+        // Loud, and NOT thrown: a missing registry means the composer switch cannot write, which the
+        // control reports on itself. Throwing here would take the whole plugin down — including the read
+        // fence, which has nothing to do with the switch — over a missing convenience channel.
+        console.error('[outsideread-switch] the commands service is unavailable, so the composer switch'
+          + ' cannot change the setting. The read fence is unaffected. Edit the state file instead.')
+        return
+      }
+      const definition = {
+        name: 'outside-read',
+        description: 'Allow or forbid the model to read outside the session workspace. The only setting'
+          + ' this plugin stores; writes are the harness sandbox\'s business.',
+        input: { hint: 'on | off' },
+        handler: function (invocation) {
+          const raw = String(invocation && invocation.rawInput ? invocation.rawInput : '').trim().toLowerCase()
+          const current = currentState()
+          if (raw === '' || raw === 'status') {
+            return {
+              kind: 'success',
+              text: 'outsideRead is ' + String(current.outsideRead) + ' (' + stateName(current) + ').',
+            }
+          }
+          let next
+          if (raw === 'on' || raw === 'true') next = true
+          else if (raw === 'off' || raw === 'false') next = false
+          else return { kind: 'error', text: 'Usage: /outside-read on | off | status' }
+
+          if (next === current.outsideRead) {
+            return { kind: 'success', text: 'outsideRead is already ' + String(next) + '.' }
+          }
+          try {
+            persistState({ outsideRead: next })
+          } catch (error) {
+            return {
+              kind: 'error',
+              text: 'Could not write the state file: ' + String(error && error.message ? error.message : error),
+            }
+          }
+          commandFlips += 1
+          console.log('[outsideread-switch] command switched outsideRead', current.outsideRead, '->', next)
+          return {
+            kind: 'success',
+            text: 'outsideRead is now ' + String(next) + ' (' + stateName({ outsideRead: next }) + ').',
+          }
+        },
+      }
+      cmdCtx.commands.register(definition)
+      console.log('[outsideread-switch] switch command registered: /outside-read on|off')
+    })
+
+    console.log('[outsideread-switch] active; state file =', STATE_FILE, '; outsideRead =', currentState().outsideRead)
   },
 }
 
