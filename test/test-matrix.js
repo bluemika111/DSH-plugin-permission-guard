@@ -425,5 +425,30 @@ check('the env override wins over the home directory', forced === 'D:/forced', f
 delete process.env.DSH_PERMISSION_GUARD_WORKSPACE
 
 console.log('')
+console.log('=== no stale four-mode vocabulary reaches a user ===')
+
+// THIS CHECK EXISTS BECAUSE THE SAME DEFECT SHIPPED TWICE. A user-facing string kept describing the
+// design that had been replaced: first a composer note naming a tool the model cannot reach, then the
+// installer's closing message still promising "the initial mode is 2 (workspace write)" and telling the
+// reader to change it with an indicator that was never able to change anything. Both were found by a
+// person reading the screen, not by this suite, so the suite now reads the shipped strings too.
+//
+// Comments are STRIPPED first: the migration table in index.js and the rationale in modes.js name the old
+// modes on purpose, and documentation of history is not a stale instruction.
+const STALE = ['Workspace write', 'Workspace read', 'Full access', 'initial mode', 'mode 1-4', 'mode number']
+const SHIPPED = ['index.js', 'modes.js', 'client.js', 'bin/install.js']
+for (let i = 0; i < SHIPPED.length; i++) {
+  const rel = SHIPPED[i]
+  const raw = fs.readFileSync(path.join(ROOT, rel), 'utf8')
+  const code = raw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter(function (line) { return line.trim().indexOf('//') !== 0 })
+    .join('\n')
+  const found = STALE.filter(function (phrase) { return code.indexOf(phrase) !== -1 })
+  check('no stale four-mode wording is reachable in ' + rel, found.length === 0, found.join(', '))
+}
+
+console.log('')
 console.log(failures === 0 ? 'ALL PASS' : failures + ' FAILURES')
 process.exitCode = failures === 0 ? 0 : 1

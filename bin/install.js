@@ -382,10 +382,12 @@ function install(options) {
   info('Installed. RESTART DSH for it to take effect — the composition is evaluated only at')
   info('startup, so the plugin will not appear until then.')
   info('')
-  info('After restarting you should see a permission indicator in the composer, and the')
-  info('permission_mode tool becomes available. The initial mode is 2 (workspace write),')
-  info('matching the harness default. Change it with the indicator or by editing')
-  info('permissions.json next to the installed plugin.')
+  info('After restarting you should see an outside-read switch in the composer, and the')
+  info('permission_mode tool becomes available. The initial setting is outsideRead: false —')
+  info('the model may NOT read outside the session workspace. Writes are not affected; the')
+  info('harness sandbox confines those. To allow outside reads, edit outsideRead in')
+  info('permissions.json next to the installed plugin. The composer switch DISPLAYS the')
+  info('setting and does not change it: flipping it needs a channel the model cannot reach.')
 }
 
 function uninstall(options) {
